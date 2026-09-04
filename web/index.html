@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SimplyCodes × Goaffpro</title>
+<style>
+  :root {
+    --bg:        oklch(0.17 0.012 265);
+    --surface:   oklch(0.215 0.014 265);
+    --surface-2: oklch(0.255 0.016 265);
+    --line:      oklch(0.32 0.016 265);
+    --ink:       oklch(0.96 0.004 265);
+    --muted:     oklch(0.755 0.014 265);
+    --accent:    oklch(0.80 0.155 78);
+    --accent-ink:oklch(0.24 0.06 78);
+    --ok:        oklch(0.78 0.15 155);
+    --danger:    oklch(0.70 0.17 25);
+
+    --display: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --body: "Segoe UI", system-ui, -apple-system, sans-serif;
+    --data: Consolas, "Cascadia Mono", ui-monospace, monospace;
+
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    --z-sticky: 10;
+  }
+  * { box-sizing: border-box; }
+  /* Shell de app: la página entera NO scrollea, scrollea el contenido. Con
+     el sidebar sticky dentro de un body de altura 100% no había recorrido y
+     la barra se iba con el scroll, dejando media columna vacía. */
+  html { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 var(--body);
+    display: grid; grid-template-columns: 232px 1fr;
+    height: 100vh; overflow: hidden;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+  /* ---------- barra lateral ---------- */
+  .rail {
+    background: var(--surface); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; padding: 22px 14px 16px;
+    height: 100vh; overflow-y: auto;
+  }
+  .mark { font-family: var(--display); font-size: 19px; line-height: 1.2; padding: 0 8px 20px;
+          display: flex; flex-direction: column; }
+  .mark span { white-space: nowrap; }
+  .mark em { font-style: italic; color: var(--accent); }
+  .mark small { display: block; font-family: var(--body); font-size: 11.5px;
+                letter-spacing: .02em; color: var(--muted); margin-top: 4px; }
+  nav { display: flex; flex-direction: column; gap: 2px; }
+  .nav-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 10px; border-radius: 7px; border: 0; width: 100%;
+    background: transparent; color: var(--muted); font: 500 14.5px var(--body);
+    text-align: left; cursor: pointer;
+    transition: background .18s var(--ease), color .18s var(--ease);
+  }
+  .nav-item:hover { background: var(--surface-2); color: var(--ink); }
+  .nav-item[aria-current="page"] { background: var(--surface-2); color: var(--ink); }
+  .nav-item[aria-current="page"] .tick { background: var(--accent); }
+  .tick { width: 3px; height: 18px; border-radius: 2px; background: transparent; }
+  .count { font: 12px var(--data); color: var(--muted); }
+
+  .rail-foot { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--line); }
+  .state { display: flex; align-items: center; gap: 9px; font-size: 13.5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .state.run .dot { background: var(--accent); animation: pulse 1.6s infinite var(--ease); }
+  .state.done .dot { background: var(--ok); }
+  .state small { display: block; color: var(--muted); font-size: 12px; }
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+
+  /* ---------- contenido ---------- */
+  main { padding: 34px 34px 56px; height: 100vh; overflow-y: auto; }
+  main > .view { max-width: 1100px; }
+  h1 { font-family: var(--display); font-size: 27px; font-weight: 400; margin: 0 0 6px;
+       letter-spacing: -0.01em; text-wrap: balance; }
+  .lede { color: var(--muted); margin: 0 0 30px; max-width: 68ch; text-wrap: pretty; }
+  .view[hidden] { display: none; }
+
+  section { border-top: 1px solid var(--line); padding: 22px 0 4px; }
+  section:first-of-type { border-top: 0; padding-top: 0; }
+  h2 { font-size: 14.5px; font-weight: 600; color: var(--ink); margin: 0 0 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 18px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
+  input[type=text], input[type=email], input[type=password], input[type=number], input[type=search] {
+    width: 100%; padding: 9px 11px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font: 14px var(--body);
+    transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
+  }
+  input::placeholder { color: oklch(0.66 0.014 265); }
+  input:hover { border-color: var(--surface-2); }
+  input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px oklch(0.80 0.155 78 / .16); }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; max-width: 70ch; }
+  .check { display: flex; gap: 13px; align-items: flex-start; margin-top: 20px; cursor: pointer; }
+  .check b { display: block; font-size: 14px; font-weight: 600; }
+  .check span { font-size: 13px; color: var(--muted); }
+
+  /* toggle: el input nativo sigue siendo el control (teclado, foco, forms),
+     solo se le dibuja encima la pista y la perilla */
+  .switch { appearance: none; margin: 2px 0 0; flex: none; cursor: pointer;
+            width: 40px; height: 22px; border-radius: 999px; position: relative;
+            background: var(--surface-2); border: 1px solid var(--line);
+            transition: background .18s var(--ease), border-color .18s var(--ease); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px;
+                   width: 16px; height: 16px; border-radius: 50%; background: var(--muted);
+                   transition: transform .18s var(--ease), background .18s var(--ease); }
+  .switch:hover { border-color: var(--accent); }
+  .switch:checked { background: var(--accent); border-color: var(--accent); }
+  .switch:checked::after { transform: translateX(18px); background: var(--accent-ink); }
+
+  /* la ruta de una carpeta no entra en una columna del grid */
+  .wide { grid-column: 1 / -1; }
+  .path { display: flex; gap: 8px; }
+  .path input { flex: 1 1 auto; min-width: 0; }
+  .path button { flex: none; padding: 0 14px; border: 1px solid var(--line);
+                 background: var(--surface-2); color: var(--ink); font-weight: 500; }
+  .path button:hover { border-color: var(--accent); }
+  /* toggle ver contraseña: ojo dibujado con CSS, dentro del campo */
+  .pw { position: relative; }
+  .pw input { padding-right: 40px; }
+  .pw .eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+             width: 30px; height: 30px; border: 0; background: transparent; padding: 0;
+             color: var(--muted); display: grid; place-items: center; }
+  .pw .eye:hover { color: var(--ink); }
+  .pw .eye i { position: relative; display: block; width: 20px; height: 12px;
+               border: 2px solid currentColor; border-radius: 50%; }
+  .pw .eye i::after { content: ""; position: absolute; left: 50%; top: 50%;
+                      width: 6px; height: 6px; margin: -3px 0 0 -3px;
+                      border-radius: 50%; background: currentColor; }
+  .pw .eye.on i::before { content: ""; position: absolute; left: -4px; top: 3px;
+                          width: 28px; height: 2px; background: currentColor;
+                          transform: rotate(45deg); }
+
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 28px; }
+  button { font: 600 14.5px var(--body); border-radius: 8px; cursor: pointer;
+           transition: background .16s var(--ease), border-color .16s var(--ease), opacity .16s var(--ease); }
+  .primary { padding: 11px 22px; border: 0; background: var(--accent); color: var(--accent-ink); }
+  .primary:hover:not(:disabled) { background: oklch(0.86 0.15 78); }
+  .ghost { padding: 10px 18px; border: 1px solid var(--line); background: transparent; color: var(--ink); }
+  .ghost:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  #msg { margin-top: 18px; padding: 12px 14px; border-radius: 8px; font-size: 14px;
+         border: 1px solid var(--line); background: var(--surface); display: none; }
+  #msg.on { display: block; }
+  #msg.err { border-color: var(--danger); color: var(--danger); }
+  #msg.run { border-color: var(--accent); color: var(--accent); }
+  #msg.ok  { border-color: var(--ok); color: var(--ok); }
+
+  /* ---------- tablas ---------- */
+  .scroller { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  thead th { position: sticky; top: 0; z-index: var(--z-sticky); background: var(--surface-2);
+             font-size: 11.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  .runs tbody tr { cursor: pointer; transition: background .14s var(--ease); }
+  .runs tbody tr:hover, .runs tbody tr:focus-visible { background: var(--surface-2); }
+  .runs td:first-child { font-family: var(--data); }
+  .tag { font: 11px var(--data); padding: 2px 7px; border-radius: 999px;
+         border: 1px solid var(--accent); color: var(--accent); }
+  .num { font-family: var(--data); color: var(--muted); }
+
+  .sortable { cursor: pointer; user-select: none; }
+  .sortable:hover { color: var(--ink); }
+  .sortable::after { content: ""; margin-left: 6px; }
+  th[aria-sort="ascending"]::after { content: "\2191"; color: var(--accent); }
+  th[aria-sort="descending"]::after { content: "\2193"; color: var(--accent); }
+  .preview td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  .preview td.n { font-family: var(--data); }
+
+  .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 16px; }
+  .bar input[type=search] { max-width: 260px; }
+  .bar .spacer { margin-left: auto; }
+  .crumb { background: none; border: 0; color: var(--muted); font: 13px var(--body);
+           cursor: pointer; padding: 0; }
+  .crumb:hover { color: var(--accent); }
+  .empty { border: 1px dashed var(--line); border-radius: 10px; padding: 34px 22px;
+           color: var(--muted); text-align: center; }
+  .empty b { display: block; color: var(--ink); font-size: 15px; margin-bottom: 6px; }
+
+  /* ---------- error logs ---------- */
+  .errsum { border: 1px solid var(--danger); border-radius: 8px; padding: 12px 14px;
+            color: var(--danger); font-size: 14px; margin: 0 0 16px; }
+  pre.errlog { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+               padding: 16px; overflow-x: auto; font: 13px/1.5 var(--data); color: var(--ink);
+               white-space: pre-wrap; word-break: break-word; max-height: 60vh; }
+  .nav-item .count.warn { color: var(--danger); }
+
+  /* ---------- instrucciones ---------- */
+  .readme { max-width: 74ch; }
+  .readme h1 { font-size: 22px; margin: 0 0 14px; }
+  .readme h1:not(:first-child) { margin-top: 34px; }
+  .readme h2 { font-size: 16px; margin: 26px 0 10px; }
+  .readme h3 { font-size: 13.5px; color: var(--muted); margin: 18px 0 8px; }
+  .readme p { color: var(--muted); line-height: 1.55; margin: 0 0 12px; }
+  .readme a { color: var(--accent); }
+  .readme ul { margin: 0 0 14px; padding-left: 20px; color: var(--muted); line-height: 1.6; }
+  .readme code { background: var(--surface-2); border-radius: 4px; padding: 1px 5px; font: 12.5px var(--data); }
+  .readme pre { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+                padding: 14px 16px; overflow-x: auto; margin: 0 0 16px; }
+  .readme pre code { background: none; padding: 0; font: 13px/1.5 var(--data); color: var(--ink); }
+  .readme table { border-collapse: collapse; width: 100%; margin: 0 0 16px; font-size: 13px; }
+  .readme th, .readme td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; }
+  .readme th { background: var(--surface-2); color: var(--muted); font-weight: 600; }
+  .readme td { color: var(--ink); }
+
+  @media (max-width: 780px) {
+    body { grid-template-columns: 1fr; height: auto; overflow: visible; }
+    main { height: auto; overflow: visible; }
+    .rail { height: auto; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
+    .mark { padding-bottom: 14px; }
+    nav { flex-direction: row; }
+    .nav-item { justify-content: flex-start; }
+    .rail-foot { margin-top: 14px; }
+    main { padding: 24px 18px 44px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<aside class="rail">
+  <div class="mark"><span>Goaffpro</span><span><em>&times;</em> SimplyCodes</span><small>Panel de control</small></div>
+  <nav>
+    <button class="nav-item" data-view="launcher" aria-current="page"><span>Launcher</span><span class="tick"></span></button>
+    <button class="nav-item" data-view="historial"><span>Historial</span><span class="count" id="navCount"></span></button>
+    <button class="nav-item" data-view="errores"><span>Error logs</span><span class="count" id="navErr"></span></button>
+    <button class="nav-item" data-view="instrucciones"><span>Instrucciones</span></button>
+  </nav>
+  <div class="rail-foot">
+    <div class="state" id="state">
+      <span class="dot"></span>
+      <div><span id="stateTitle">Detenido</span><small id="stateNote">Listo para arrancar</small></div>
+    </div>
+  </div>
+</aside>
+
+<main>
+  <!-- ---------------- Launcher ---------------- -->
+  <div class="view" id="view-launcher">
+    <h1>Arrancar una corrida</h1>
+    <p class="lede">El programa toma la ventana de Chrome mientras trabaja: no uses la computadora hasta que termine.
+       Para cortar: <b>Ctrl+Alt+F12</b> (funciona con cualquier ventana activa) o el bot&oacute;n <b>Detener</b>.</p>
+
+    <form id="f">
+      <section>
+        <h2>Cuenta Goaffpro</h2>
+        <div class="grid">
+          <div><label for="ge">Email</label><input id="ge" type="email" name="goaffpro_email" required autocomplete="username"></div>
+          <div><label for="gp">Contrase&ntilde;a</label><div class="pw"><input id="gp" type="password" name="goaffpro_password" required autocomplete="current-password"><button type="button" class="eye" aria-label="Mostrar contrase&ntilde;a" onclick="const i=this.parentElement.querySelector('input'),s=i.type==='password';i.type=s?'text':'password';this.classList.toggle('on',s);this.setAttribute('aria-label',(s?'Ocultar':'Mostrar')+' contraseña')"><i></i></button></div></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Datos para los formularios de los merchants</h2>
+        <div class="grid">
+          <div><label for="fn">Nombre</label><input id="fn" type="text" name="first_name"></div>
+          <div><label for="ln">Apellido</label><input id="ln" type="text" name="last_name"></div>
+          <div><label for="ph">Tel&eacute;fono</label><input id="ph" type="text" name="phone"></div>
+          <div><label for="co">Pa&iacute;s</label><input id="co" type="text" name="country"></div>
+          <div><label for="st">Provincia o estado</label><input id="st" type="text" name="state"></div>
+          <div><label for="ci">Ciudad</label><input id="ci" type="text" name="city"></div>
+        </div>
+        <p class="hint">Si un portal pide un dato que no est&aacute; ac&aacute;, el programa frena y te lo pide en la consola.</p>
+      </section>
+
+      <section>
+        <h2>Cobro de comisiones</h2>
+        <div class="grid">
+          <div><label for="pp">Email de PayPal</label><input id="pp" type="email" name="paypal_email"></div>
+        </div>
+        <p class="hint">Se carga en Pagos &rarr; Par&aacute;metros &rarr; Modo de pago = PayPal en cada portal de afiliado.
+           Dejalo vac&iacute;o para no tocar el m&eacute;todo de pago.</p>
+      </section>
+
+      <section>
+        <h2>Corrida</h2>
+        <div class="grid">
+          <div><label for="sa">Cantidad de tiendas a completar</label><input id="sa" type="number" name="stop_after" min="1" placeholder="sin tope"></div>
+          <div class="wide"><label for="cd">Carpeta para los CSV</label>
+            <div class="path">
+              <input id="cd" type="text" name="csv_dir" placeholder="C:\Users\Pc\Desktop\csv">
+              <button type="button" id="pick">Elegir</button>
+            </div>
+          </div>
+        </div>
+        <label class="check">
+          <input type="checkbox" class="switch" role="switch" id="unlimited">
+          <span><b>Correr indefinido</b>
+            Sin tope de tiendas: sigue buscando y completando hasta que apret&eacute;s ESC, Ctrl+Alt+F12 o el bot&oacute;n Detener.</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" class="switch" role="switch" name="manual_screenshots">
+          <span><b>Capturas manuales</b>
+            El programa frena en cada tienda: sac&aacute;s vos la captura del dashboard y la sub&iacute;s vos misma en
+            el formulario de SimplyCodes. El bot no saca ni sube ninguna captura.</span>
+        </label>
+      </section>
+
+      <div class="actions">
+        <button class="primary" id="start" type="submit">Iniciar</button>
+        <button class="ghost" type="button" id="stop" hidden>Detener</button>
+        <button class="ghost" type="button" data-view="historial">Ver historial</button>
+      </div>
+      <div id="msg"></div>
+    </form>
+  </div>
+
+  <!-- ---------------- Historial ---------------- -->
+  <div class="view" id="view-historial" hidden>
+    <div id="list">
+      <h1>Historial de CSV</h1>
+      <p class="lede">Cada corrida deja un archivo. Abr&iacute; uno para revisar las tiendas antes de descargarlo.</p>
+      <div id="listBody"></div>
+    </div>
+
+    <div id="detail" hidden>
+      <div class="bar"><button class="crumb" id="back" type="button">&larr; Historial</button></div>
+      <h1 id="pvName">CSV</h1>
+      <p class="lede" id="pvMeta"></p>
+      <div class="bar">
+        <input type="search" id="filter" placeholder="Filtrar tiendas" aria-label="Filtrar filas">
+        <span class="num" id="pvCount"></span>
+        <span class="spacer"></span>
+        <button class="primary" id="pvDownload" type="button">Descargar</button>
+      </div>
+      <div class="scroller"><table class="preview">
+        <thead><tr id="pvHead"></tr></thead>
+        <tbody id="pvBody"></tbody>
+      </table></div>
+      <p class="hint" id="pvTrunc" hidden>Se muestran las primeras 1000 filas. La descarga trae el archivo completo.</p>
+    </div>
+  </div>
+
+  <!-- ---------------- Error logs ---------------- -->
+  <div class="view" id="view-errores" hidden>
+    <h1>Error logs</h1>
+    <p class="lede">Errores de la &uacute;ltima corrida. Se reinicia cada vez que arranc&aacute;s.
+       Copi&aacute; el texto y pas&aacute;melo para revisarlo.</p>
+    <div id="errBody"></div>
+  </div>
+
+  <!-- ---------------- Instrucciones ---------------- -->
+  <div class="view" id="view-instrucciones" hidden>
+    <div id="readmeBody" class="readme"></div>
+  </div>
+</main>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const form = $('#f'), msg = $('#msg'), startBtn = $('#start');
+const state = $('#state'), stateTitle = $('#stateTitle'), stateNote = $('#stateNote');
+
+/* ---------- navegación ---------- */
+function show(view) {
+  document.querySelectorAll('.view').forEach(v => { v.hidden = v.id !== 'view-' + view; });
+  document.querySelectorAll('.nav-item').forEach(b => {
+    if (b.dataset.view === view) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+  if (view === 'historial') { $('#detail').hidden = true; $('#list').hidden = false; loadHistory(); }
+  if (view === 'errores') loadErrors();
+  if (view === 'instrucciones') loadReadme();
+}
+document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => show(b.dataset.view)));
+
+/* ---------- launcher ---------- */
+function say(text, kind) { msg.textContent = text; msg.className = 'on ' + kind; }
+
+function setState(kind) {
+  state.className = 'state ' + (kind || '');
+  $('#stop').hidden = kind !== 'run';
+  if (kind === 'run') { stateTitle.textContent = 'Corriendo'; stateNote.textContent = 'Ctrl+Alt+F12 o el bot\u00f3n Detener para cortar'; }
+  else if (kind === 'done') { stateTitle.textContent = 'Terminado'; stateNote.textContent = 'El CSV qued\u00f3 en el historial'; }
+  else { stateTitle.textContent = 'Detenido'; stateNote.textContent = 'Listo para arrancar'; }
+}
+
+$('#stop').addEventListener('click', async () => {
+  $('#stop').disabled = true;
+  const res = await fetch('/stop', { method: 'POST', body: '{}' });
+  const body = await res.json();
+  if (body.error) { say(body.error, 'err'); $('#stop').disabled = false; return; }
+  say('Corte pedido. Termina el paso en curso, exporta el CSV y para.', 'run');
+});
+
+/* "Correr indefinido" es solo UI: no manda nada al server, refleja/vacía
+   el input de stop_after (vacío = sin tope, ya lo interpreta config.py) */
+const stopAfter = $('#sa'), unlimited = $('#unlimited');
+function syncUnlimited() {
+  stopAfter.disabled = unlimited.checked;
+  if (unlimited.checked) stopAfter.value = '';
+}
+unlimited.addEventListener('change', syncUnlimited);
+
+fetch('/config').then(r => r.json()).then(cfg => {
+  for (const [k, v] of Object.entries(cfg)) {
+    const el = form.elements[k];
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = !!v;
+    else el.value = (v === null || v === undefined) ? '' : v;
+  }
+  unlimited.checked = !stopAfter.value;
+  syncUnlimited();
+});
+
+$('#pick').addEventListener('click', async () => {
+  const btn = $('#pick');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/pick-folder', {
+      method: 'POST', body: JSON.stringify({ current: form.elements.csv_dir.value })
+    });
+    const body = await res.json();
+    if (body.error) say(body.error, 'err');
+    else if (body.path) form.elements.csv_dir.value = body.path;
+  } finally { btn.disabled = false; }
+});
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const data = {};
+  for (const el of form.elements) {
+    if (!el.name) continue;
+    data[el.name] = el.type === 'checkbox' ? el.checked : el.value.trim();
+  }
+  startBtn.disabled = true;
+  const res = await fetch('/start', { method: 'POST', body: JSON.stringify(data) });
+  const body = await res.json();
+  if (body.error) { say(body.error, 'err'); startBtn.disabled = false; return; }
+  say('Corriendo. No toques Chrome. Para cortar: Ctrl+Alt+F12 o el bot\u00f3n Detener.', 'run');
+  $('#stop').disabled = false;
+  setState('run');
+  poll();
+});
+
+async function poll() {
+  const s = await (await fetch('/status')).json();
+  if (s.running) { startBtn.disabled = true; setTimeout(poll, 3000); return; }
+  startBtn.disabled = false;
+  setState('done');
+  const err = await refreshErrCount();
+  if (err > 0) say('Termin\u00f3 con ' + err + ' error(es). Mir\u00e1 "Error logs" en el men\u00fa.', 'err');
+  else say('Termin\u00f3. El CSV est\u00e1 en el historial.', 'ok');
+  loadHistory();
+}
+
+/* ---------- error logs ---------- */
+async function refreshErrCount() {
+  const { count } = await (await fetch('/errors')).json();
+  const badge = $('#navErr');
+  badge.textContent = count || '';
+  badge.classList.toggle('warn', count > 0);
+  return count;
+}
+
+async function loadErrors() {
+  const d = await (await fetch('/errors')).json();
+  refreshErrCount();
+  const body = $('#errBody');
+  if (!d.count && !d.text.trim()) {
+    body.innerHTML = '<div class="empty"><b>Sin errores</b>' +
+      'La \u00faltima corrida no registr\u00f3 ning\u00fan error.</div>';
+    return;
+  }
+  body.innerHTML =
+    (d.summary ? '<div class="errsum">' + esc(d.summary) + '</div>' : '') +
+    '<div class="actions" style="margin-top:0"><button class="ghost" type="button" id="errCopy">Copiar</button></div>' +
+    '<pre class="errlog" id="errText">' + esc(d.text) + '</pre>';
+  $('#errCopy').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(d.text);
+    $('#errCopy').textContent = 'Copiado';
+    setTimeout(() => { $('#errCopy').textContent = 'Copiar'; }, 1500);
+  });
+}
+refreshErrCount();
+
+fetch('/status').then(r => r.json()).then(s => {
+  if (s.running) { startBtn.disabled = true; setState('run'); say('Ya hay una corrida en curso.', 'run'); poll(); }
+});
+
+/* ---------- historial ---------- */
+const fmtDate = t => new Date(t * 1000).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' });
+const fmtSize = b => b < 1024 ? b + ' B' : (b / 1024).toFixed(1) + ' kB';
+const esc = s => String(s === null || s === undefined ? '' : s)
+  .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* ---------- instrucciones (README.md) ---------- */
+let readmeLoaded = false;
+function mdToHtml(md) {
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  let html = '', inCode = false, inList = false, tableRows = null;
+  const flushList = () => { if (inList) { html += '</ul>'; inList = false; } };
+  const flushTable = () => {
+    if (!tableRows) return;
+    const [head, , ...rows] = tableRows;
+    html += '<table><thead><tr>' + head.map(c => '<th>' + inline(c) + '</th>').join('') + '</tr></thead><tbody>' +
+      rows.map(r => '<tr>' + r.map(c => '<td>' + inline(c) + '</td>').join('') + '</tr>').join('') +
+      '</tbody></table>';
+    tableRows = null;
+  };
+  for (const raw of md.split('\n')) {
+    const line = raw.trimEnd();
+    if (line.startsWith('```')) {
+      flushList(); flushTable();
+      html += inCode ? '</code></pre>' : '<pre><code>';
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { html += esc(raw) + '\n'; continue; }
+    if (/^\|.*\|$/.test(line)) {
+      (tableRows ||= []).push(line.slice(1, -1).split('|').map(c => c.trim()));
+      continue;
+    }
+    flushTable();
+    const h = line.match(/^(#{1,3})\s+(.*)/);
+    if (h) { flushList(); html += '<h' + h[1].length + '>' + inline(h[2]) + '</h' + h[1].length + '>'; continue; }
+    if (/^-\s+/.test(line)) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += '<li>' + inline(line.replace(/^-\s+/, '')) + '</li>';
+      continue;
+    }
+    flushList();
+    if (line) html += '<p>' + inline(line) + '</p>';
+  }
+  flushList(); flushTable();
+  return html;
+}
+async function loadReadme() {
+  if (readmeLoaded) return;
+  const text = await (await fetch('/readme')).text();
+  $('#readmeBody').innerHTML = mdToHtml(text);
+  readmeLoaded = true;
+}
+
+async function loadHistory() {
+  const { files } = await (await fetch('/history')).json();
+  $('#navCount').textContent = files.length || '';
+  const body = $('#listBody');
+  if (!files.length) {
+    body.innerHTML = '<div class="empty"><b>Todav\u00eda no hay CSV</b>' +
+      'Arranc\u00e1 una corrida desde el Launcher; al terminar, el archivo aparece ac\u00e1.</div>';
+    return;
+  }
+  const rows = files.map(f => '<tr tabindex="0" data-id="' + f.id + '">' +
+    '<td>' + esc(f.name) + (f.current ? ' <span class="tag">\u00faltimo</span>' : '') + '</td>' +
+    '<td>' + fmtDate(f.modified) + '</td>' +
+    '<td class="num">' + f.rows + '</td>' +
+    '<td class="num">' + fmtSize(f.size) + '</td>' +
+    '<td class="num">' + esc(f.folder) + '</td></tr>').join('');
+  body.innerHTML = '<div class="scroller"><table class="runs"><thead><tr>' +
+    '<th scope="col">Archivo</th><th scope="col">Generado</th><th scope="col">Tiendas</th>' +
+    '<th scope="col">Peso</th><th scope="col">Carpeta</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  body.querySelectorAll('tr[data-id]').forEach(tr => {
+    const open = () => openPreview(tr.dataset.id, files.find(f => f.id === tr.dataset.id));
+    tr.addEventListener('click', open);
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+}
+
+/* ---------- preview ---------- */
+let pv = { columns: [], rows: [], sort: -1, dir: 1, id: null };
+
+async function openPreview(id, meta) {
+  const data = await (await fetch('/preview?id=' + encodeURIComponent(id))).json();
+  if (data.error) { say(data.error, 'err'); loadHistory(); return; }
+  pv = { columns: data.columns, rows: data.rows, sort: -1, dir: 1, id: id };
+  $('#pvName').textContent = meta ? meta.name : 'CSV';
+  $('#pvMeta').textContent = meta ? meta.rows + ' tiendas \u00b7 ' + fmtDate(meta.modified) + ' \u00b7 ' + meta.folder : '';
+  $('#pvTrunc').hidden = !data.truncated;
+  $('#filter').value = '';
+  $('#pvHead').innerHTML = data.columns
+    .map((c, i) => '<th class="sortable" data-i="' + i + '" scope="col">' +
+                   esc(c.replace(/_/g, ' ').toLowerCase()) + '</th>').join('');
+  $('#pvHead').querySelectorAll('th').forEach(th =>
+    th.addEventListener('click', () => sortBy(Number(th.dataset.i))));
+  render();
+  $('#list').hidden = true; $('#detail').hidden = false;
+  document.querySelector('main').scrollTo({ top: 0 });
+}
+
+function sortBy(i) {
+  pv.dir = pv.sort === i ? -pv.dir : 1;
+  pv.sort = i;
+  const num = v => { const n = parseFloat(String(v).replace('%', '').replace(',', '.')); return isNaN(n) ? null : n; };
+  pv.rows.sort((a, b) => {
+    const x = a[i] === undefined ? '' : a[i], y = b[i] === undefined ? '' : b[i];
+    // los vacíos van siempre al fondo: ordenar por comisión no sirve de nada
+    // si las filas sin dato se mezclan con las mejores
+    if (!String(x).trim() && String(y).trim()) return 1;
+    if (String(x).trim() && !String(y).trim()) return -1;
+    const nx = num(x), ny = num(y);
+    if (nx !== null && ny !== null) return (nx - ny) * pv.dir;
+    return String(x).localeCompare(String(y), 'es') * pv.dir;
+  });
+  $('#pvHead').querySelectorAll('th').forEach(th => {
+    if (Number(th.dataset.i) === i) th.setAttribute('aria-sort', pv.dir === 1 ? 'ascending' : 'descending');
+    else th.removeAttribute('aria-sort');
+  });
+  render();
+}
+
+function render() {
+  const q = $('#filter').value.trim().toLowerCase();
+  const rows = q ? pv.rows.filter(r => r.some(c => String(c).toLowerCase().includes(q))) : pv.rows;
+  $('#pvBody').innerHTML = rows.map(r => '<tr>' + pv.columns.map((_, i) => {
+    const v = r[i] === undefined ? '' : r[i];
+    const isNum = v !== '' && !isNaN(parseFloat(String(v).replace('%', '')));
+    return '<td class="' + (isNum ? 'n' : '') + '" title="' + esc(v) + '">' + esc(v) + '</td>';
+  }).join('') + '</tr>').join('');
+  $('#pvCount').textContent = rows.length + ' de ' + pv.rows.length + ' filas';
+}
+
+$('#filter').addEventListener('input', render);
+$('#back').addEventListener('click', () => { $('#detail').hidden = true; $('#list').hidden = false; });
+$('#pvDownload').addEventListener('click', () => { window.location = '/csv?id=' + encodeURIComponent(pv.id); });
+
+loadHistory();
+</script>
+</body>
+</html>

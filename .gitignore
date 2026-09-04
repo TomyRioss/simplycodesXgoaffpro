@@ -1,0 +1,12 @@
+.env
+docs/models.md
+docs/credentials.md
+*.db
+screenshots/
+debug_*.png
+debug_*.html
+__pycache__/
+config.json
+export_*.csv
+errors.log
+STOP
