@@ -3,7 +3,7 @@ import json
 import re
 import urllib.parse
 
-from blockers import page_is_blocked, pause
+from blockers import UserSkipped, intervention_loop, page_is_blocked, pause, pause_yn
 from log import log
 
 LOOKUP_URL = "https://simplycodes.com/ajax/lookup.php?datatype=merchants&term={term}"
@@ -131,8 +131,21 @@ def find_store(driver, name: str, domain: str) -> dict | None:
     exacto, que es lo que identifica la tienda sin ambigüedad."""
     goal_domain = _norm_domain(domain)
 
+    # Dominio primero: es el identificador exacto y suele acertar al 1er
+    # goto (ej. 'ridevolt' en vez de probar el título entero con cola de
+    # marketing que da null). Ahorra 2-3 gotos (~15-25s) por match. El
+    # desempate sigue siendo por dominio, el orden no cambia el resultado.
+    terms = _search_terms(name, domain)
+    _label = _domain_label(domain)
+    if len(_label) < 2:
+        _label = ""
+    if goal_domain and _label and _label.lower() not in {t.lower() for t in terms}:
+        terms = [_label] + terms
+    elif goal_domain and _label:
+        terms = [_label] + [t for t in terms if t.lower() != _label.lower()]
+
     results = []
-    for term in _search_terms(name, domain):
+    for term in terms:
         results = _lookup(driver, term)
         # con dominio conocido se sigue probando términos hasta encontrarlo:
         # una búsqueda puede devolver homónimos que no son esta tienda.
@@ -222,9 +235,9 @@ def _clean_header(raw: str) -> str:
     return got.strip()
 
 
-def read_badge(driver) -> str | None:
+def read_badge(driver) -> str:
     """Badge que se puede ganar agregando un código para esta tienda, o
-    None si la tienda no ofrece ninguno.
+    "NO BADGE" si la tienda no ofrece ninguno.
 
     Devuelve el tier ("Gold"/"Silver"/"Bronze") cuando la página lo expone,
     y si no el nombre del badge ("Pioneer"), que siempre está.
@@ -255,12 +268,12 @@ def read_badge(driver) -> str | None:
         driver.find(text="Tips for", control_type="Text", exact=False, timeout=6)
     except Exception:
         log("simplycodes.read_badge: la tienda no ofrece badge")
-        return None
+        return "NO BADGE"
 
     items = driver.page_ordered(control_types=("Text",))
     start = next((i for i, (_, n, _) in enumerate(items) if n.startswith("Tips for")), None)
     if start is None:
-        return None
+        return "NO BADGE"
 
     name = ""
     for _, n, _el in items[start + 1:]:
@@ -270,8 +283,121 @@ def read_badge(driver) -> str | None:
             name = n
             break
 
-    log(f"simplycodes.read_badge: badge = {name or None!r} (tier no expuesto por accesibilidad)")
-    return name or None
+    log(f"simplycodes.read_badge: badge = {name or 'NO BADGE'} (tier no expuesto por accesibilidad)")
+    return name or "NO BADGE"
+
+
+_POPULARITY_RX = re.compile(r"(?:store\s+)?popularity\s*:", re.IGNORECASE)
+_NEEDING_RX = re.compile(r"(?:coins?|codes?)\s+needed\s*\??\s*(?::|$)", re.IGNORECASE)
+_COIN_RATE_RX = re.compile(r"(?:current\s+)?coin\s*rate\s*:", re.IGNORECASE)
+
+
+def _tip_items(driver):
+    """Items de texto del contenido de la página en orden de documento,
+    sin los vacíos ni los nodos sueltos de marcado ('*', '•').
+
+    Leer los valores anotándolos al label NO es lo mismo que una regex
+    sobre page_text(): el sitio puede separar label y valor en dos nodos
+    ('Store popularity' / 'High'), y la página tiene otro texto al lado
+    ('Current coin rate' de la barra del editor) que contamina los
+    matches sueltos."""
+    try:
+        items = []
+        for ct, name, _el in driver.page_ordered(control_types=("Text",)):
+            name = (name or "").strip()
+            if name and name not in ("*", "•", "￼"):
+                items.append((ct, name))
+        return items
+    except Exception:
+        return []
+
+
+def _label_to_value(driver, patterns: dict, items=None) -> dict:
+    """Por cada (clave -> regex de label) devuelve el valor que le sigue en
+    el documento: el resto del mismo nodo ('Popularity: Very low') o el
+    nodo siguiente ('Popularity' + 'Very low')."""
+    if items is None:
+        items = _tip_items(driver)
+    found = {}
+    for i, (_ct, name) in enumerate(items):
+        for key, rx in patterns.items():
+            if key in found:
+                continue
+            m = rx.search(name)
+            if not m:
+                continue
+            rest = name[m.end():].strip().strip(":")
+            if rest:
+                found[key] = rest
+                continue
+            for _ct2, nxt in items[i + 1:i + 3]:
+                if nxt.strip():
+                    found[key] = nxt.strip()
+                    break
+    return found
+
+
+def _tips_slice(driver, items) -> list:
+    """Los items a partir del encabezado 'Tips for {tienda}', donde vive el
+    panel con popularity/coins needed/coin rate de ESTA tienda. La página
+    tiene una barra del editor con 'Current coin rate' de la CUENTA (igual
+    en cualquier tienda): buscar ahí primero evita guardar el valor
+    equivocado, y si el panel no aparece se cae a la página entera."""
+    try:
+        start = next((i for i, (_ct, n) in enumerate(items) if n.lower().startswith("tips for")), None)
+    except Exception:
+        start = None
+    if start is None:
+        return items
+    return items[start:]
+
+
+def read_popularity(driver) -> tuple[str | None, str | None, str | None]:
+    """(popularidad, necesidad_de_códigos, coin_rate) de la tienda actual
+    en /editor/add/{slug}, o (None, None, None) si no se pudo leer.
+
+    Viven DENTRO del desplegable 'Tips for {tienda}', colapsado por
+    default — a diferencia del badge (visible sin abrirlo), acá hay que
+    clickear para que el texto exista. Si la tienda ya está procesada no se
+    vuelve a clickear (el toggle lo cerraría)."""
+    patterns = {
+        "popularity": _POPULARITY_RX,
+        "needing_codes": _NEEDING_RX,
+        "coin_rate": _COIN_RATE_RX,
+    }
+    items = _tip_items(driver)
+
+    # primero el panel de tips (dato de la tienda); si no aparece todo,
+    # se re-busca en la página entera por si el layout no tiene el panel
+    found = _label_to_value(driver, patterns, items=_tips_slice(driver, items))
+    if len(found) < len(patterns):
+        found.update(_label_to_value(driver, patterns, items=items))
+
+    if len(found) < len(patterns):
+        try:
+            # click() NO sirve acá: 'Tips for {tienda}' es un Text (div con
+            # accordion, no Button), invoke()/ENTER no lo togglean y el panel
+            # quedaba cerrado — por eso popularity/needing salían del párrafo
+            # de abajo o vacíos. click_element() es click real de mouse sobre
+            # el centro del header y sí expande el panel (probado en vivo).
+            el = driver.find(text="Tips for", control_type="Text", exact=False, timeout=6)
+            driver.click_element(el)
+        except Exception:
+            log("simplycodes.read_popularity: no encontré 'Tips for', sigo con lo que haya", level="warn")
+        else:
+            for _ in range(5):
+                driver.wait_for_timeout(600)
+                items = _tip_items(driver)
+                found.update(_label_to_value(driver, patterns, items=_tips_slice(driver, items)))
+                found.update(_label_to_value(driver, patterns, items=items))
+                if len(found) == len(patterns):
+                    break
+
+    popularity = found.get("popularity")
+    needing_codes = found.get("needing_codes")
+    coin_rate = found.get("coin_rate")
+    log(f"simplycodes.read_popularity: popularity={popularity!r} needing_codes={needing_codes!r} coin_rate={coin_rate!r}")
+    return popularity, needing_codes, coin_rate
 
 
 def _safe_top(el):
@@ -290,9 +416,11 @@ def add_coupon(driver, slug: str, store: dict):
 
     if reason := page_is_blocked(driver):
         log(f"simplycodes.add_coupon: BLOQUEADO — {reason}")
-        pause(f"{store['name']}: /editor/add/{slug} — {reason}")
+        if not pause_yn(f"{store['name']}: /editor/add/{slug} — {reason}", store["name"]):
+            raise UserSkipped(f"{store['name']}: editor bloqueado, marcada fallada a pedido del usuario")
 
     store["badge"] = read_badge(driver)
+    store["popularity"], store["needing_codes"], store["coin_rate"] = read_popularity(driver)
 
     code = (store.get("affiliate_code") or "").strip()
     if not code:
@@ -309,7 +437,7 @@ def add_coupon(driver, slug: str, store: dict):
 
     log(f"simplycodes.add_coupon: llenando código de cupón '{code}'")
     _fill_labeled(driver, ("enter coupon code", "coupon code"), code)
-    _click_continue(driver, "paso 1")
+    _click_continue(driver, "paso 1", store)
 
     _fill_discount_step(driver, discount, store.get("discount_type") or "percent", store)
 
@@ -326,28 +454,40 @@ def add_coupon(driver, slug: str, store: dict):
         raise RuntimeError(f"'{store['name']}': no hay screenshot de prueba, SimplyCodes la exige")
 
     driver.wait_for_timeout(800)
-    _click_continue(driver, "paso 2")
+    _click_continue(driver, "paso 2", store)
 
     # el paso 3 muestra el título generado ("10% Off (Storewide) at X") y el
     # botón 'Finished', que sí es un Button de verdad
-    try:
-        finish = driver.find_any(["Finished", "Finalizar"], control_type="Button", timeout=8)
-    except Exception:
-        raise RuntimeError(f"'{store['name']}': no apareció el botón 'Finished', el cupón NO se envió")
+    page_before_finish = driver.page_text()
 
-    title = next(
-        (driver.value(el) for _l, el in driver.form_fields()
-         if el.element_info.control_type == "Edit" and " at " in driver.value(el)),
-        "",
-    )
-    log(f"simplycodes.add_coupon: título generado = {title!r}")
+    def _attempt_submit() -> bool:
+        try:
+            finish = driver.find_any(["Finished", "Finalizar"], control_type="Button", timeout=8)
+        except Exception:
+            # El botón ya no está: si la página cambió, el usuario (o el
+            # submit) ya lo mandó; si no, sigue sin terminar.
+            return driver.page_text() != page_before_finish
 
-    before = driver.page_text()
-    log("simplycodes.add_coupon: click en 'Finished' (submit final)")
-    driver.click_element(finish)
-    driver.wait_for_timeout(2500)
-    if driver.page_text() == before:
-        raise RuntimeError(f"'{store['name']}': 'Finished' no hizo nada, el cupón NO se envió")
+        title = next(
+            (driver.value(el) for _l, el in driver.form_fields()
+             if el.element_info.control_type == "Edit" and " at " in driver.value(el)),
+            "",
+        )
+        log(f"simplycodes.add_coupon: título generado = {title!r}")
+
+        before = driver.page_text()
+        log("simplycodes.add_coupon: click en 'Finished' (submit final)")
+        driver.click_element(finish)
+        driver.wait_for_timeout(2500)
+        return driver.page_text() != before
+
+    if not _attempt_submit():
+        intervention_loop(
+            f"{store['name']}: no apareció el botón 'Finished' o el click no envió el cupón. "
+            "Revisá la ventana de Chrome y completá la carga a mano si hace falta",
+            store["name"],
+            _attempt_submit,
+        )
 
     store["status"] = "coupon_submitted"
     log(f"simplycodes.add_coupon: '{store['name']}' -> status = coupon_submitted")
@@ -426,15 +566,20 @@ def _fill_labeled(driver, label_options, value: str):
     driver.fill(value)
 
 
-def _click_continue(driver, step: str):
+def _click_continue(driver, step: str, store: dict):
     """Clickea 'Continue' y verifica que el formulario haya avanzado.
 
     'Continue' se expone como Text (no Button): no tiene patrón Invoke ni
     acepta foco, así que hay que clickearlo con el mouse, y antes traerlo a
     pantalla porque suele quedar abajo del viewport. Sin eso el click no
     pasaba nada, el formulario se quedaba en el paso 1, y el error recién
-    aparecía después ('no encontré % Off') apuntando al lugar equivocado."""
-    before = driver.page_text()
+    aparecía después ('no encontré % Off') apuntando al lugar equivocado.
+
+    Si los 3 reintentos no alcanzan es una falla CRÍTICA: el código del
+    cupón ya está lleno y es válido, no se tira a la basura marcando
+    coupon_failed — se pide intervención humana (con alarma) y se reintenta
+    hasta que el usuario diga que está resuelto (Y) o la marque fallada (N)."""
+    page_before = driver.page_text()
     for attempt in range(3):
         try:
             el = driver.find_any(["Continue", "Continuar"], timeout=5)
@@ -442,11 +587,34 @@ def _click_continue(driver, step: str):
             break
         driver.click_element(el)
         driver.wait_for_timeout(1200)
-        if driver.page_text() != before:
+        if driver.page_text() != page_before:
             log(f"simplycodes.add_coupon: '{step}' avanzó")
             return
         log(f"simplycodes.add_coupon: '{step}' no avanzó, reintento {attempt + 1}/3", level="warn")
-    raise RuntimeError(f"el botón 'Continue' del {step} no avanzó el formulario")
+    intervention_loop(
+        f"{store['name']}: el botón 'Continue' del {step} no avanzó el formulario ni después de "
+        "3 reintentos automáticos",
+        store["name"],
+        lambda: _advance_check(driver, step, page_before),
+    )
+
+
+def _advance_check(driver, step: str, page_before: str) -> bool:
+    """Un intento de avanzar tras intervención humana: clickea 'Continue'
+    (si sigue existiendo) y verifica contra el snapshot previo. Devuelve
+    True si el paso avanzó — aunque haya sido el usuario quien lo hizo."""
+    try:
+        el = driver.find_any(["Continue", "Continuar"], timeout=3)
+    except Exception:
+        return driver.page_text() != page_before
+    driver.click_element(el)
+    driver.wait_for_timeout(1200)
+    ok = driver.page_text() != page_before
+    log(
+        f"simplycodes.add_coupon: '{step}' {'avanzó tras intervención' if ok else 'sigue sin avanzar'}",
+        level="ok" if ok else "warn",
+    )
+    return ok
 
 
 _FILENAME_LABELS = re.compile(r"^(file\s*name|nombre de archivo|nombre|nom du fichier|dateiname)\s*:$", re.IGNORECASE)

@@ -11,6 +11,7 @@ un `wait_for`/reintento puntual ahí, no reescribir el driver.
 """
 
 import ctypes
+import ctypes.wintypes
 import re
 import time
 
@@ -35,6 +36,12 @@ except Exception:
 
 class ElementNotFound(Exception):
     pass
+
+
+class StopRequested(Exception):
+    """El usuario pidió cortar (Ctrl+Alt+F12/ESC/archivo STOP) durante una
+    espera larga del driver: se aborta la operación en curso para cortar ya,
+    sin esperar los timeouts de goto/find/scroll."""
 
 
 # type_keys() interpreta estos caracteres como modificadores/secuencias, no
@@ -93,37 +100,114 @@ def _url_key(url: str) -> str:
 
 class ChromeDriver:
     def __init__(self):
+        self.stop_event = None
+        self._url_cache, self._url_cache_at = "", 0.0
         self.window = self._find_chrome_window()
         self.window.set_focus()
+        self._snap_left_half()
+
+    def check_stop(self):
+        """Aborta con StopRequested si el usuario pidió cortar. Se llama en
+        cada loop de espera largo: sin esto, un Ctrl+Alt+F12 durante un
+        goto() de 3 intentos x 12s no cortaba hasta que terminara."""
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise StopRequested()
+
+    def _visible_rect(self, wr):
+        """Intersección del rect de la ventana con el área de trabajo del
+        monitor (sin la barra de tareas). La taskbar tapa los últimos ~40px
+        de la ventana: un elemento 'dentro de la ventana' pero debajo de
+        ella NO está visible y el click en su centro cae en la taskbar —
+        era por lo que el 'Continue' del editor de SimplyCodes nunca
+        avanzaba (centro del botón en y=1045, taskbar desde y=1040)."""
+        try:
+            user32 = ctypes.windll.user32
+            left, top = wr.left, wr.top
+            right, bottom = wr.right, wr.bottom
+            work = (ctypes.c_long * 4)()
+            if not user32.SystemParametersInfoW(0x0030, 0, work, 0):  # SPI_GETWORKAREA
+                return (left, top, right, bottom)
+            left = max(left, work[0])
+            top = max(top, work[1])
+            right = min(right, work[2])
+            bottom = min(bottom, work[3])
+            if right <= left or bottom <= top:
+                return (wr.left, wr.top, wr.right, wr.bottom)
+            return (left, top, right, bottom)
+        except Exception:
+            return (wr.left, wr.top, wr.right, wr.bottom)
+
+    def _snap_left_half(self):
+        """Ubica la ventana de Chrome en la mitad izquierda de la pantalla
+        (la consola va en la mitad derecha, ver main._snap_console_right_half),
+        para que el usuario vea ambas a la vez mientras corre el script.
+
+        Se mueve por handle con user32 directo, no con
+        HwndWrapper.move_window(): el wrapper que devuelve Desktop(backend=
+        "uia") es un UIAWrapper y ese método no existe ahí (sí en el backend
+        win32) — probado en vivo, tiraba AttributeError."""
+        try:
+            user32 = ctypes.windll.user32
+            screen_w = user32.GetSystemMetrics(0)
+            screen_h = user32.GetSystemMetrics(1)
+            hwnd = self.window.handle
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE, por si estaba maximizada
+            user32.MoveWindow(hwnd, 0, 0, screen_w // 2, screen_h, True)
+            log("winchrome: ventana de Chrome ubicada en la mitad izquierda de la pantalla")
+        except Exception as e:
+            log(f"winchrome: no pude reubicar la ventana de Chrome ({e})", level="warn")
 
     def _find_chrome_window(self, attempts: int = 3):
-        """Busca la ventana de Chrome. Reintenta porque la enumeración de
-        ventanas es un snapshot COM: si justo se está abriendo o cerrando
-        una pestaña, la ventana puede no aparecer en esa pasada y el script
-        moría con 'no encontré Chrome' teniéndolo abierto adelante."""
+        """Busca la ventana de Chrome con EnumWindows nativo (GetClassNameW /
+        GetWindowTextW), no con Desktop().windows(): el backend uia recorre
+        el árbol COMPLETO del escritorio con COM y una sola ventana colgada
+        (app elevada, renderer ocupado) bloquea esa llamada 20-60s o para
+        siempre — medido en vivo: 18.9s con 9 ventanas. EnumWindows es un
+        snapshot Win32 que no bloquea (~0ms con 249 ventanas). El wrapper
+        UIA se crea recién para la ventana elegida, que sí es rápido.
+
+        Reintenta porque la enumeración es un snapshot: si justo se está
+        abriendo o cerrando una pestaña, la ventana puede no aparecer en esa
+        pasada y el script moría con 'no encontré Chrome' teniéndolo abierto
+        adelante."""
+        u = ctypes.windll.user32
         for attempt in range(attempts):
-            candidates = []
-            for w in Desktop(backend="uia").windows():
+            found = []
+
+            def _cb(hwnd, _lparam):
+                if not u.IsWindowVisible(hwnd):
+                    return True
+                buf = ctypes.create_unicode_buffer(256)
+                u.GetClassNameW(hwnd, buf, 256)
+                if buf.value != "Chrome_WidgetWin_1":
+                    return True
+                # Mientras hay un diálogo nativo abierto, Chrome expone
+                # además una ventana auxiliar sin título y deshabilitada.
+                # Quedarse con la primera que aparezca agarraba esa, y
+                # todo type_keys() posterior moría con ElementNotVisible.
+                title = ctypes.create_unicode_buffer(512)
+                u.GetWindowTextW(hwnd, title, 512)
+                if not (title.value or "").strip():
+                    return True
+                pid = ctypes.wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 try:
-                    if w.element_info.class_name != "Chrome_WidgetWin_1" or not w.is_visible():
-                        continue
-                    if psutil.Process(w.process_id()).name().lower() != "chrome.exe":
-                        continue
-                    # Mientras hay un diálogo nativo abierto, Chrome expone
-                    # además una ventana auxiliar sin título y deshabilitada.
-                    # Quedarse con la primera que aparezca agarraba esa, y
-                    # todo type_keys() posterior moría con ElementNotVisible.
-                    if not (w.window_text() or "").strip():
-                        continue
-                    r = w.rectangle()
-                    candidates.append((r.width() * r.height(), w))
+                    if psutil.Process(pid.value).name().lower() != "chrome.exe":
+                        return True
                 except Exception:
-                    continue
-            if candidates:
+                    return True
+                rect = ctypes.wintypes.RECT()
+                u.GetWindowRect(hwnd, ctypes.byref(rect))
+                found.append((hwnd, (rect.right - rect.left) * (rect.bottom - rect.top)))
+                return True
+
+            u.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(_cb), 0)
+            if found:
                 # la ventana más grande es la del navegador real
-                w = max(candidates, key=lambda c: c[0])[1]
-                if len(candidates) > 1:
-                    log(f"winchrome: {len(candidates)} ventanas de Chrome, uso la más grande")
+                hwnd = max(found, key=lambda c: c[1])[0]
+                if len(found) > 1:
+                    log(f"winchrome: {len(found)} ventanas de Chrome, uso la más grande")
+                w = Desktop(backend="uia").window(handle=hwnd)
                 log(f"winchrome: encontré ventana de Chrome — '{w.window_text()}'")
                 return w
             if attempt + 1 < attempts:
@@ -173,14 +257,22 @@ class ChromeDriver:
             # instante con la página anterior todavía cargada, y el paso
             # siguiente leía el resultado de la consulta anterior.
             deadline = time.time() + 12
+            t0, last_report = time.time(), 0.0
             while time.time() < deadline:
+                self.check_stop()
                 # startswith y no ==: muchas de estas URLs redirigen sin que
                 # sea un error (/affiliate -> /affiliate/dashboard, /login ->
                 # /affiliate si la sesión ya estaba abierta).
-                if _url_key(self.current_url()).startswith(target):
+                if _url_key(self.current_url(use_cache=False)).startswith(target):
                     self._wait_for_new_document(before)
                     return
-                time.sleep(0.3)
+                # Sin este aviso, con COM lento hay hasta 36s de silencio y
+                # parece colgado con la página ya cargada.
+                if time.time() - last_report >= 5:
+                    last_report = time.time()
+                    log(f"winchrome.goto: todavía esperando {url} "
+                        f"(está en '{self.current_url(use_cache=False)}', {int(time.time() - t0)}s)")
+                time.sleep(0.8)
             log(f"winchrome.goto: intento {attempt + 1} no llegó a la URL exacta (está en '{self.current_url()}')")
 
         # Si el dominio es el correcto, la página redirigió a otra ruta y
@@ -204,19 +296,62 @@ class ChromeDriver:
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
-            time.sleep(0.4)
+            self.check_stop()
+            time.sleep(0.8)
             now = self.page_text()
             if now and now != before and now == last:
                 return
             last = now
         log("winchrome.goto: la página no se estabilizó a tiempo, sigo igual")
 
-    def current_url(self) -> str:
+    def current_url(self, use_cache: bool = True) -> str:
+        """URL de la omnibox.
+
+        Cada lectura es UN scan COM completo del árbol: con COM lento, los
+        callers que la invocan en loop (goto cada 0.8s) o por campo
+        (form_fields vía _is_omnibox) quemaban minutos en silencio. Por eso
+        hay caché de 2s — el loop de goto la saltea (use_cache=False) porque
+        ahí sí necesita dato fresco."""
+        if use_cache and time.monotonic() - self._url_cache_at < 2.0:
+            return self._url_cache
+        url = self._current_url_fresh()
+        self._url_cache, self._url_cache_at = url, time.monotonic()
+        return url
+
+    def _current_url_fresh(self) -> str:
+        """Lectura real (sin caché). Fast path primero: si el primer Edit ya
+        parece URL, es la omnibox y sale con 1 sola llamada COM. Solo si no,
+        se busca por nombre accesible (el dashboard de Goaffpro tiene inputs
+        propios que antes se devolvían como si fueran la URL y el goto
+        esperaba 3×12s con la página ya cargada). Sin nada confiable se
+        devuelve "" (nunca basura: decidir sobre basura es peor que esperar).
+        """
         try:
-            omnibox = self.window.descendants(control_type="Edit")[0]
-            return omnibox.window_text() or ""
+            edits = self.window.descendants(control_type="Edit")
         except Exception:
             return ""
+        if not edits:
+            return ""
+        try:
+            first = edits[0].window_text() or ""
+        except Exception:
+            first = ""
+        if "://" in first or first.startswith("www."):
+            return first
+        for el in edits:  # la omnibox por su nombre accesible
+            try:
+                if el.element_info.name == "Address and search bar":
+                    return el.window_text() or ""
+            except Exception:
+                continue
+        for el in edits:  # el primer Edit con pinta de URL
+            try:
+                t = el.window_text() or ""
+            except Exception:
+                continue
+            if "://" in t or t.startswith("www."):
+                return t
+        return ""
 
     def wait_for_url_contains(self, substr: str, timeout: int = 20):
         log(f"winchrome.wait_for_url_contains: esperando '{substr}' (timeout={timeout}s)")
@@ -224,8 +359,27 @@ class ChromeDriver:
         while time.time() < deadline:
             if substr in self.current_url():
                 return
-            time.sleep(0.5)
+            self.check_stop()
+            time.sleep(1.0)
         raise TimeoutError(f"URL nunca contuvo '{substr}', quedó en '{self.current_url()}'")
+
+    def new_tab(self):
+        """Abre una pestaña nueva (Ctrl+T) para trabajo secundario
+        (SimplyCodes/dashboard) sin perder la página de Goaffpro/search
+        de la pestaña original. Al terminar, close_tab() vuelve sola a
+        la original — así no hay que reabrir /search + '100 per page' +
+        N clicks en 'Next' por cada tienda (~25-30s ahorrados)."""
+        self.window.set_focus()
+        self.window.type_keys("^t", pause=0.05)
+        time.sleep(0.6)
+
+    def close_tab(self):
+        """Cierra la pestaña activa (Ctrl+W). Chrome devuelve el foco solo a
+        la pestaña que la abrió (portales de merchant que se abren con
+        target=_blank) — así no se acumula una pestaña nueva por tienda."""
+        self.window.set_focus()
+        self.window.type_keys("^w")
+        time.sleep(0.4)
 
     # --- lectura de la página ---
 
@@ -239,16 +393,17 @@ class ChromeDriver:
         una regex que busca el encabezado lo matchea a el y se lleva el
         sufijo pegado: fue lo que hizo descartar tiendas que si existian."""
         chunks = []
+        current = self.current_url() if skip_chrome_ui else None
         for el in self._descendants():
             t = (el.window_text() or "").strip()
             if not t:
                 continue
-            if skip_chrome_ui and self._is_chrome_ui(el):
+            if skip_chrome_ui and self._is_chrome_ui(el, current):
                 continue
             chunks.append(t)
         return "\n".join(chunks)
 
-    def _is_chrome_ui(self, el) -> bool:
+    def _is_chrome_ui(self, el, current=None) -> bool:
         """True si el elemento es de la interfaz de Chrome (pestanas,
         omnibox) y no del contenido de la pagina."""
         try:
@@ -257,7 +412,7 @@ class ChromeDriver:
             return False
         if ct in ("TabItem", "Tab"):
             return True
-        if ct == "Edit" and self._is_omnibox(el):
+        if ct == "Edit" and self._is_omnibox(el, current):
             return True
         return "Google Chrome" in (el.window_text() or "")
 
@@ -274,6 +429,7 @@ class ChromeDriver:
         correcta."""
         deadline = time.time() + 2.0
         while True:
+            self.check_stop()
             doc = self._main_document()
             if doc is not None:
                 try:
@@ -348,6 +504,7 @@ class ChromeDriver:
         deadline = time.time() + timeout
         last_err = None
         while time.time() < deadline:
+            self.check_stop()
             for el in self._descendants(control_type):
                 name = (el.window_text() or "").strip()
                 if text is None:
@@ -367,6 +524,7 @@ class ChromeDriver:
         cambio cosmético."""
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.check_stop()
             for el in self._descendants(control_type):
                 name = (el.window_text() or "").strip().lower()
                 if not name:
@@ -446,24 +604,31 @@ class ChromeDriver:
     def in_view(self, el) -> bool:
         """True si el rectángulo del elemento cae dentro del área visible de
         la ventana. `is_visible()` no alcanza: para un elemento web devuelve
-        True aunque esté scrolleado fuera de pantalla."""
+        True aunque esté scrolleado fuera de pantalla.
+
+        El área visible es la intersección con el área de trabajo del
+        monitor: la barra de tareas tapa los últimos ~40px de la ventana y
+        ahí el 'Continue' del editor de SimplyCodes quedaba 'visible' pero
+        su centro caía sobre la taskbar — el click no hacía nada."""
         try:
             r, wr = el.rectangle(), self.window.rectangle()
         except Exception:
             return False
-        return wr.top <= r.top and r.bottom <= wr.bottom and wr.left <= r.left and r.right <= wr.right
+        vr = self._visible_rect(wr)
+        return vr[1] <= r.top and r.bottom <= vr[3] and vr[0] <= r.left and r.right <= vr[2]
 
     def scroll_into_view(self, el, max_scrolls: int = 30) -> bool:
         """Scrollea hasta que el elemento entre en pantalla, en la dirección
         que corresponda."""
         for _ in range(max_scrolls):
+            self.check_stop()
             if self.in_view(el):
                 return True
             try:
-                r, wr = el.rectangle(), self.window.rectangle()
+                r, vr = el.rectangle(), self._visible_rect(self.window.rectangle())
             except Exception:
                 return False
-            self.wheel_scroll(-4 if r.top > wr.top else 4)
+            self.wheel_scroll(-4 if r.top > vr[1] else 4)
             time.sleep(0.12)
         return self.in_view(el)
 
@@ -522,6 +687,7 @@ class ChromeDriver:
         combo.type_keys("{HOME}")
         time.sleep(0.25)
         for _ in range(max_options):
+            self.check_stop()
             if self.value(combo).strip().lower() == want:
                 log(f"winchrome.select_option: {label!r} elegida")
                 return True
@@ -538,6 +704,7 @@ class ChromeDriver:
         tipo el form de cupón de Simplycodes). Scrollea hasta que se pueda
         verificar visible, o se agotan los intentos."""
         for _ in range(max_scrolls):
+            self.check_stop()
             try:
                 if el.is_visible():
                     return
@@ -595,8 +762,18 @@ class ChromeDriver:
     def wheel_scroll(self, clicks: int = -10):
         """Scroll real de la página (rueda del mouse sobre el centro de la
         ventana). Page Down / flechas NO mueven el scroll de esta página
-        (probado en vivo, coordenadas no cambian) — la rueda sí."""
-        wr = self.window.rectangle()
+        (probado en vivo, coordenadas no cambian) — la rueda sí.
+
+        rectangle() es una llamada COM a UI Automation y de tanto en tanto
+        tira un COMError transitorio ('Un evento no pudo invocar a ninguno
+        de los subscriptores') sin relación con el estado real de la
+        ventana — visto en vivo justo al cortar con ESC. Sin este catch
+        tumbaba la corrida entera por un solo scroll fallido."""
+        try:
+            wr = self.window.rectangle()
+        except Exception as e:
+            log(f"winchrome.wheel_scroll: COM falló leyendo el rectángulo de la ventana ({e}), salteo este scroll", level="warn")
+            return
         cx, cy = (wr.left + wr.right) // 2, (wr.top + wr.bottom) // 2
         _mouse_scroll(coords=(cx, cy), wheel_dist=clicks)
 
@@ -718,6 +895,7 @@ class ChromeDriver:
         que son nodos sueltos entre el label y su input."""
         fields = []
         label = ""
+        current = self.current_url()  # UNA vez: _is_omnibox por campo re-escanearía el árbol entero
         for el in self._descendants():
             try:
                 ct = el.element_info.control_type
@@ -728,7 +906,7 @@ class ChromeDriver:
                 if t and t not in ("*", "•", "￼"):
                     label = t
             elif ct in ("Edit", "CheckBox", "ComboBox"):
-                if ct == "Edit" and self._is_omnibox(el):
+                if ct == "Edit" and self._is_omnibox(el, current):
                     continue
                 fields.append((label, el))
                 label = ""
@@ -757,14 +935,23 @@ class ChromeDriver:
             el.type_keys(escape_keys(value), with_spaces=True, pause=0.03)
         time.sleep(0.25)
 
-    def _is_omnibox(self, el) -> bool:
-        """La barra de direcciones de Chrome también es un Edit del árbol."""
+    def _is_omnibox(self, el, current=None) -> bool:
+        """La barra de direcciones de Chrome también es un Edit del árbol.
+        `current` evita re-escanear el árbol por cada campo (ver
+        current_url/use_cache). Ojo con el "" : con URL desconocida un Edit
+        vacío matcheaba `t == current_url()` y form_fields saltaba inputs
+        vacíos reales como si fueran la omnibox."""
         try:
-            return el.element_info.name == "Address and search bar" or "://" in (el.window_text() or "") or (
-                el.window_text() or ""
-            ).strip() == self.current_url()
+            if el.element_info.name == "Address and search bar":
+                return True
+            t = el.window_text() or ""
         except Exception:
             return False
+        if "://" in t:
+            return True
+        if current is None:
+            current = self.current_url()
+        return bool(current) and t.strip() == current
 
     def find_owned_dialog(self, timeout: float = 10.0, class_name: str = "#32770"):
         """Devuelve el diálogo nativo de Windows que abrió Chrome (el

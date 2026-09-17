@@ -300,8 +300,8 @@ def test_config_roundtrip():
 
     original = config.CONFIG_PATH.read_text(encoding="utf-8") if config.CONFIG_PATH.exists() else None
     try:
-        saved = config.save({"first_name": "Ana", "batch_size": "7", "max_batches": "", "manual_screenshots": True})
-        assert saved["batch_size"] == 7 and saved["max_batches"] is None
+        saved = config.save({"first_name": "Ana", "stop_after": "7", "manual_screenshots": True})
+        assert saved["stop_after"] == 7
         cfg = config.load()
         assert cfg["first_name"] == "Ana"
         assert cfg["manual_screenshots"] is True
@@ -353,9 +353,180 @@ def test_webui_endpoints():
         server.shutdown()
 
 
+def test_my_stores_pagination():
+    """My Stores pagina de a 10 ('Page 1 of 3' confirmado en vivo): el
+    panel de una tienda recién afiliada puede estar en la página 2/3. Sin
+    recorrer las páginas, read_coupon_code daba 'pendiente de
+    verificación' con el código ya publicado (caso Phillips Moore)."""
+    page1 = [
+        _t("Swiss Tides"),
+        _t("Referral Link"),
+        _e("https://swiss-tides.com/?ref=cnbqzqfv"),
+        _t("Coupon Code"),
+        _e("tomasrios"),
+        ("Hyperlink", "Go to portal", FakeEl("https://x.goaffpro.com/login-as/TOKEN")),
+    ]
+    page2 = [
+        _t("Phillips Moore"),
+        _t("Referral Link"),
+        _e("https://www.phillips-moore.com/?ref=bdrcznld"),
+        _t("Coupon Code"),
+        _e("tomasrios"),
+        ("Hyperlink", "Go to portal", FakeEl("https://x.goaffpro.com/login-as/TOKEN")),
+    ]
+    d = FakePaginatedDriver([page1, page2])
+    assert goaffpro._find_panel(d, "Phillips Moore", "www.phillips-moore.com") is None
+    assert goaffpro._click_next(d) is True
+    assert goaffpro._find_panel(d, "Phillips Moore", "www.phillips-moore.com")["code"] == "tomasrios"
+    assert goaffpro._click_next(d) is False
+
+
+def test_dashboard_coupon_code():
+    """El código también está a simple vista en el dashboard del merchant
+    (mismo template Goaffpro): 'Coupon Code 25% off' + descripción +
+    'tomasrios'. El parse ancla al label para no agarrar 'CLOUDFLARE'."""
+    items = [
+        _t("Referral Link 10%"),
+        _t("Refer your friends using the link below and earn commissions on purchases made by them"),
+        _t("Coupon Code 25% off"),
+        _t("Share your coupon code with others. For every purchase someone makes using your coupon code, you get the credit"),
+        _t("tomasrios"),
+    ]
+    assert goaffpro._dashboard_coupon_code(FakeDriver(items)) == "tomasrios"
+    # merchant que no publicó código: None, no se adivina
+    assert goaffpro._dashboard_coupon_code(FakeDriver([_t("Referral Link 10%"), _t("Summary"), _t("0")])) is None
+    # merchant SIN cupón (caso real Kumrat Fashion/Wacocetoy): el template
+    # dice 'No coupon code found!' -> NoCouponCode (estado final, NO CODE),
+    # no se lee 'Summary' como código.
+    no_code = [
+        _t("Referral Link 7%"),
+        _t("Coupon Code"),
+        _t("Share your coupon code with others. For every purchase someone makes using your coupon code, you get the credit"),
+        _t("No coupon code found! You can request us for a coupon code to share with your followers. Contact us"),
+        _t("Summary"),
+        _t("0"),
+        _t("0"),
+        _t("0%"),
+        _t("£0"),
+        _t("£0"),
+    ]
+    try:
+        goaffpro._dashboard_coupon_code(FakeDriver(no_code))
+        raise AssertionError("esperaba NoCouponCode")
+    except goaffpro.NoCouponCode:
+        pass
+    # 'Summary' después de 'Coupon Code' sin mensaje explícito tampoco es código
+    assert goaffpro._dashboard_coupon_code(
+        FakeDriver([_t("Coupon Code"), _t("Summary"), _t("0")])
+    ) is None
+
+
+def test_read_coupon_code_dashboard_fallback():
+    """Panel ausente en My Stores (o sin código) pero código visible en el
+    dashboard: el fallback lo agarra en vez de tirar NeedsVerification."""
+    dashboard = [
+        _t("Referral Link 10%"),
+        _t("Coupon Code 25% off"),
+        _t("Share your coupon code with others. For every purchase someone makes using your coupon code, you get the credit"),
+        _t("tomasrios"),
+    ]
+    d = FakeDriver(dashboard)
+    store = {"name": "Phillips Moore", "domain": "www.phillips-moore.com", "affiliate_portal": "phillips-moore.goaffpro.com"}
+    assert goaffpro._dashboard_fallback(d, store) is True
+    assert store["affiliate_code"] == "tomasrios"
+    assert store["portal_url"] == "https://phillips-moore.goaffpro.com"
+    assert d.last_url == "https://phillips-moore.goaffpro.com"
+    # sin affiliate_portal ni portal: no hay forma de leer el dashboard
+    assert goaffpro._dashboard_fallback(FakeDriver(dashboard), {"name": "X"}) is False
+    # dashboard sin bloque de cupón: sigue NeedsVerification
+    assert goaffpro._dashboard_fallback(FakeDriver([_t("Summary")]), {"name": "Y", "affiliate_portal": "y.goaffpro.com"}) is False
+    # dashboard que dice que NO hay cupón: NoCouponCode (estado final)
+    no_code_dash = [
+        _t("Referral Link 7%"),
+        _t("Coupon Code"),
+        _t("No coupon code found! You can request us for a coupon code to share with your followers. Contact us"),
+        _t("Summary"),
+    ]
+    try:
+        goaffpro._dashboard_fallback(
+            FakeDriver(no_code_dash),
+            {"name": "Kumrat Fashion", "affiliate_portal": "kumrat.goaffpro.com"},
+        )
+        raise AssertionError("esperaba NoCouponCode")
+    except goaffpro.NoCouponCode:
+        pass
+
+
+def test_read_coupon_code_end_to_end():
+    """read_coupon_code recorre las páginas de My Stores y agarra el panel
+    de la página 2 (caso real Phillips Moore)."""
+    page1 = [
+        _t("Swiss Tides"),
+        _t("Referral Link"),
+        _e("https://swiss-tides.com/?ref=cnbqzqfv"),
+        _t("Coupon Code"),
+        _e("tomasrios"),
+        ("Hyperlink", "Go to portal", FakeEl("https://x.goaffpro.com/login-as/TOKEN")),
+    ]
+    page2 = [
+        _t("Phillips Moore"),
+        _t("Referral Link"),
+        _e("https://www.phillips-moore.com/?ref=bdrcznld"),
+        _t("Coupon Code"),
+        _e("tomasrios"),
+        ("Hyperlink", "Go to portal", FakeEl("https://x.goaffpro.com/login-as/TOKEN")),
+    ]
+    d = FakePaginatedDriver([page1, page2])
+    store = {"name": "Phillips Moore", "domain": "www.phillips-moore.com"}
+    goaffpro.read_coupon_code(d, store)
+    assert store["affiliate_code"] == "tomasrios"
+    assert "login-as" in store["portal_url"]
+
+
+class FakeNext:
+    def __init__(self, drv):
+        self._drv = drv
+
+    def is_enabled(self):
+        return self._drv.page < len(self._drv.pages) - 1
+
+    def invoke(self):
+        if self.is_enabled():
+            self._drv.page += 1
+
+
+class FakePaginatedDriver(FakeDriver):
+    """My Stores paginado: cada página tiene sus propios items y el botón
+    'Next' avanza de página (como el botón real de Goaffpro)."""
+
+    def __init__(self, pages):
+        super().__init__()
+        self.pages = pages
+        self.page = 0
+
+    def ordered(self, control_types=None):
+        items = self.pages[self.page]
+        return [(ct, name, el) for ct, name, el in items if not control_types or ct in control_types]
+
+    def find(self, text=None, control_type=None, exact=True, timeout=10):
+        if text == "Next" and control_type == "Button":
+            return FakeNext(self)
+        raise goaffpro.ElementNotFound(f"no encontré elemento text={text!r}")
+
+    def activate(self, el):
+        el.invoke()
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
 if __name__ == "__main__":
     test_escape_keys()
     test_my_stores()
+    test_my_stores_pagination()
+    test_dashboard_coupon_code()
+    test_read_coupon_code_dashboard_fallback()
+    test_read_coupon_code_end_to_end()
     test_simplycodes_matching()
     test_search_terms()
     test_open_editor_states()

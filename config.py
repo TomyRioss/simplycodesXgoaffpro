@@ -9,8 +9,8 @@ la web.
 `.env` sigue siendo el default de las credenciales (compatibilidad con las
 corridas actuales); si `config.json` trae valor, ese gana.
 
-ponytail: JSON plano, sin esquema ni validación de tipos más allá de los
-ints de las tandas — un archivo de config de 15 claves no necesita más.
+ponytail: JSON plano, sin esquema ni validación de tipos más allá del int
+de `stop_after` — un archivo de config de 12 claves no necesita más.
 """
 
 import json
@@ -37,14 +37,12 @@ DEFAULTS = {
     # método de pago por comisión en el portal de afiliado
     "paypal_email": "",
     # corrida
-    "batch_size": 10,
-    "max_batches": "",
     "stop_after": "",
     "manual_screenshots": False,
     "csv_dir": "",
 }
 
-_INTS = ("batch_size", "max_batches", "stop_after")
+_INTS = ("stop_after",)
 
 
 def _as_int(value):
@@ -89,7 +87,7 @@ def demo():
     assert _as_int(" 7 ") == 7 and _as_int(7) == 7
     cfg = load()
     assert set(cfg) == set(DEFAULTS)
-    assert cfg["batch_size"] is None or isinstance(cfg["batch_size"], int)
+    assert cfg["stop_after"] is None or isinstance(cfg["stop_after"], int)
     print("config: ok")
 
 

@@ -35,24 +35,20 @@ maneja la ventana. Al terminar, "Descargar CSV" baja el `export.csv`.
 python main.py
 ```
 
-Por default corre en tandas de 10 tiendas, en loop, hasta que apretás **ESC** (con la consola de `main.py` enfocada, no la de Chrome). Al cortar, exporta `export.csv`.
+Por default corre sin tope, recorriendo el catálogo de Goaffpro en loop, hasta que apretás **ESC** (con la consola de `main.py` enfocada, no la de Chrome), Ctrl+Alt+F12, o el botón Detener del launcher. Al cortar, exporta `export.csv`.
 
 ### Parámetros
 
 | Flag | Qué hace | Default |
 |---|---|---|
-| `--batch-size N` | Tiendas a buscar/cruzar por tanda | 10 |
-| `--max-batches N` | Corta sola después de N tandas | sin tope |
-| `--stop-after N` | Corta sola al juntar N tiendas persistidas, sin esperar ESC | sin tope |
+| `--stop-after N` | Corta sola al juntar N tiendas completadas (cupón subido), sin esperar ESC | sin tope |
 | `--csv-dir RUTA` | Carpeta donde dejar una copia fechada del CSV | la del launcher |
 | `--retry-pending` | No descubre tiendas nuevas: solo reintenta las que quedaron a medias (`pending_verification`, `coupon_failed`, etc.) y sale | — |
 
 Ejemplos:
 
 ```
-python main.py --batch-size 20              # tandas de 20 en vez de 10
-python main.py --stop-after 50               # corta sola al juntar 50 tiendas persistidas
-python main.py --batch-size 10 --max-batches 3   # como mucho 3 tandas (30 tiendas revisadas)
+python main.py --stop-after 50               # corta sola al juntar 50 tiendas completadas
 python main.py --retry-pending               # solo reintenta pendientes, no busca tiendas nuevas
 ```
 
@@ -62,12 +58,12 @@ Apretá **ESC** con la ventana de la consola (`main.py`) enfocada. Corta al toqu
 
 ## Reintentar pendientes
 
-Por cada tienda nueva, `main.py` corre el flujo completo (afiliación → código → cupón → método de pago) antes de pasar a la siguiente. Si el merchant todavía no generó el código de cupón, la tienda queda `pending_verification` y **no se reintenta sola** — hay que correr `python main.py --retry-pending` a mano (dale unos minutos antes, para que el merchant tenga tiempo de generarlo).
+Por cada tienda nueva, `main.py` corre el flujo completo (afiliación → código → cupón → método de pago) antes de pasar a la siguiente. Las que quedan a medias (`pending_verification`, `coupon_failed`, `enrolled` sin código, etc.) **se reintentan solas al arrancar cada tanda del loop** — por eso, si un merchant todavía no generó el código, alcanza con correr `python main.py` de nuevo y la tienda se retoma (dale unos minutos antes, para que el merchant tenga tiempo de generarlo). Con `python main.py --retry-pending` se reintentan SOLO esas y sale, sin descubrir tiendas nuevas.
 
 ## Salida
 
 - `export.csv`: todas las tiendas que matchearon Goaffpro+Simplycodes, con columnas fijas (ver `db.CSV_COLUMNS` o `docs/GOAL.md`), ordenadas por comisión de afiliado (mejores arriba). `POPULARITY` y `NEEDING_CODES` van vacías: no tienen fuente real en el sitio (ver `docs/GOAL.md`).
-- `data.db` (SQLite): persistencia local, incluye tiendas rechazadas (para no re-chequearlas en la próxima tanda) y la página de Goaffpro donde quedó el descubrimiento.
+- `data.db` (SQLite): persistencia local, incluye tiendas rechazadas (para no re-chequearlas en el próximo rescaneo) y la página de Goaffpro donde quedó el descubrimiento.
 - `screenshots/`: captura de 'My Stores' de Goaffpro con el código de cada tienda afiliada (prueba que se sube a SimplyCodes al cargar el cupón).
 
 ## Bloqueos

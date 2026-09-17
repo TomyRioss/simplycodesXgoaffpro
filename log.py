@@ -6,6 +6,8 @@ from pathlib import Path
 # Los errores se copian acá para que el launcher web pueda mostrarlos: main.py
 # corre en otra consola y sin esto sus errores no los junta nadie.
 ERRORS_PATH = Path(__file__).parent / "errors.log"
+# Toda la salida de la corrida (no solo errores), para el panel de consola del launcher.
+RUN_LOG_PATH = Path(__file__).parent / "run.log"
 
 _LEVELS = {
     "info": ("", ""),
@@ -28,12 +30,13 @@ if hasattr(sys.stdout, "buffer") and (sys.stdout.encoding or "").lower() not in 
 
 
 def reset_errors():
-    """Vacía errors.log — se llama al arrancar cada corrida para que el archivo
-    tenga solo los errores de la última."""
-    try:
-        ERRORS_PATH.write_text("", encoding="utf-8")
-    except OSError:
-        pass
+    """Vacía errors.log y run.log — se llama al arrancar cada corrida para que
+    tengan solo lo de la última."""
+    for path in (ERRORS_PATH, RUN_LOG_PATH):
+        try:
+            path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
 
 
 def log(msg: str, level: str = "info"):
@@ -46,6 +49,11 @@ def log(msg: str, level: str = "info"):
         print(out, flush=True)
     except UnicodeEncodeError:
         print(out.encode("ascii", "replace").decode("ascii"), flush=True)
+    try:
+        with RUN_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
     if level == "error":
         try:
             with ERRORS_PATH.open("a", encoding="utf-8") as f:

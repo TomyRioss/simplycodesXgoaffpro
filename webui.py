@@ -31,10 +31,11 @@ import config
 
 HERE = Path(__file__).parent
 INDEX = HERE / "web" / "index.html"
-README_PATH = HERE / "README.md"
+README_PATH = HERE / "docs" / "WEBUI.md"
 CSV_PATH = HERE / "export.csv"
 STOP_FLAG = HERE / "STOP"
 ERRORS_PATH = HERE / "errors.log"
+RUN_LOG_PATH = HERE / "run.log"
 PORT = 8765
 
 _proc: subprocess.Popen | None = None
@@ -187,6 +188,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"files": _history()})
         elif path == "/errors":
             self._json(_errors())
+        elif path == "/log":
+            text = RUN_LOG_PATH.read_text(encoding="utf-8") if RUN_LOG_PATH.exists() else ""
+            self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8")
         elif path == "/readme":
             text = README_PATH.read_text(encoding="utf-8") if README_PATH.exists() else "README.md no encontrado."
             self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8")

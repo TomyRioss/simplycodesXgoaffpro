@@ -1,4 +1,5 @@
 import csv
+import re
 import sqlite3
 from pathlib import Path
 
@@ -29,7 +30,8 @@ CREATE TABLE IF NOT EXISTS stores (
     goaffpro_commission TEXT,
     simplycodes_name TEXT,
     coin_rate TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state (
@@ -42,18 +44,48 @@ CSV_COLUMNS = [
     "STORE_NAME", "STORE_DOMAIN", "AFFILIATE_PORTAL", "AFFILIATE_PORTAL_SIGNUP",
     "REGISTRATIONS_OPENS", "APPROVED_AUTOMATICALLY", "COOKIE_DURATION", "CURRENCY",
     "COMISSION_TYPE", "COMISSION_AMOUNT", "COMISSION_ON", "STORE_LINK_SIMPLY",
-    "STORE_NAME_SIMPLY", "EDITOR_ADD_SIMPLY", "POPULARITY", "NEEDING_CODES", "BADGE_AVAILABLE",
+    "STORE_NAME_SIMPLY", "EDITOR_ADD_SIMPLY", "POPULARITY", "COIN_RATE", "NEEDING_CODES",
+    "BADGE_AVAILABLE", "STATUS",
 ]
 
+# Cómo se ve cada estado en el CSV. `no_code` = el dashboard del merchant
+# dijo explícitamente que no hay cupón: estado final (failed).
+_STATUS_LABEL = {
+    "no_code": "NO CODE",
+    "coupon_submitted": "OK",
+    "pending_verification": "PENDING VERIFICATION",
+    "enrolled": "ENROLLED",
+    "enroll_failed": "ENROLL FAILED",
+    "coupon_failed": "COUPON FAILED",
+    "user_failed": "FAILED",
+    "discovered": "NEW",
+}
+
 _BADGE_RANK = {"gold": 3, "silver": 2, "bronze": 1}
-_TIER_RANK = {"high": 3, "medium": 2, "low": 1}
+# "Store popularity" en el desplegable 'Tips for {tienda}' de SimplyCodes
+# (confirmado en vivo: Nike = "Very high", Flathub = "Low" — varía por
+# tienda de verdad, a diferencia de "Current coin rate" que es de cuenta).
+_POPULARITY_RANK = {"highest": 5, "very high": 4, "high": 3, "medium": 2, "low": 1, "very low": 0}
+# "Coin rate" que muestra el panel de tips del editor por tienda; si viene
+# como número ("10x", "5 coins") se usa el valor, si no como palabra.
+_COIN_RATE_RANK = {"very high": 5, "high": 3, "medium": 2, "low": 1, "very low": 0}
+
+
+def _coin_rate_rank(value: str) -> float:
+    if not value:
+        return 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)", value)
+    if m:
+        return float(m.group(1))
+    return _COIN_RATE_RANK.get(value.strip().lower(), 0)
 
 
 _NEW_COLUMNS = [
     "affiliate_portal", "affiliate_portal_signup", "registrations_opens",
     "approved_automatically", "cookie_duration", "currency",
     "goaffpro_commission", "simplycodes_name", "coin_rate", "goaffpro_page",
-    "payment_method",
+    "payment_method", "popularity", "needing_codes",
+    "completed_at",
 ]
 
 
@@ -85,12 +117,23 @@ def set_state(conn, key: str, value):
     conn.commit()
 
 
-def count_completed(conn) -> int:
+def count_completed(conn, since_run: str | None = None) -> int:
     """Tiendas con el flujo terminado de verdad (cupón subido a Simplycodes).
+
+    `since_run` (ISO timestamp del arranque de esta corrida): cuando se pasa,
+    solo cuentan las que se COMPLETARON en esta run (completed_at >= arranque),
+    no las de corridas anteriores — `--stop-after` debe medir el trabajo de
+    la run actual, no el histórico. Sin `since_run` cuenta todo.
+
     No cuenta pending_verification/enroll_failed/coupon_failed — esos son
     intentos que no llegaron a destino, --stop-after no debe darlos por
     buenos."""
-    return conn.execute("SELECT COUNT(*) FROM stores WHERE status = 'coupon_submitted'").fetchone()[0]
+    if since_run is None:
+        return conn.execute("SELECT COUNT(*) FROM stores WHERE status = 'coupon_submitted'").fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM stores WHERE status = 'coupon_submitted' AND completed_at IS NOT NULL AND completed_at >= ?",
+        (since_run,),
+    ).fetchone()[0]
 
 
 def already_seen(conn, goaffpro_store_id: str) -> bool:
@@ -137,7 +180,11 @@ def _commission_pct(value: str) -> float:
 def export_csv(conn, path: str = "export.csv"):
     """Vuelca todas las tiendas persistidas al CSV pedido en
     docs/Servicios_SimplyCodes_Scrapping — ordenado con las mejores
-    (mayor comisión, mejor badge, mejor popularidad) arriba."""
+    (mayor comisión, mejor popularidad, mejor coin rate, mejor badge) arriba.
+
+    Los valores de popularidad/coins needed/coin rate salen del panel
+    'Tips for {tienda}' de /editor/add en SimplyCodes (se abre con un
+    click), y el badge del chip de esa misma página."""
     rows = conn.execute(
         "SELECT * FROM stores WHERE status NOT LIKE 'rejected_%'"
     ).fetchall()
@@ -145,8 +192,9 @@ def export_csv(conn, path: str = "export.csv"):
         rows,
         key=lambda r: (
             _commission_pct(r["goaffpro_commission"]),
+            _POPULARITY_RANK.get((r["popularity"] or "").lower(), 0),
+            _coin_rate_rank(r["coin_rate"]),
             _BADGE_RANK.get((r["badge"] or "").lower(), 0),
-            _TIER_RANK.get((r["coin_rate"] or "").lower(), 0),
         ),
         reverse=True,
     )
@@ -170,8 +218,10 @@ def export_csv(conn, path: str = "export.csv"):
                 f"https://simplycodes.com/{slug}" if slug else "",
                 r["simplycodes_name"],
                 f"https://simplycodes.com/editor/add/{slug}" if slug else "",
+                r["popularity"],
                 r["coin_rate"],
-                "",  # NEEDING_CODES: sin fuente confirmada, queda vacío
-                r["badge"],
+                r["needing_codes"],
+                r["badge"] or "NO BADGE",
+                _STATUS_LABEL.get((r["status"] or "").lower(), r["status"] or ""),
             ])
     return path

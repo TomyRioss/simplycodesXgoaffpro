@@ -2,13 +2,19 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from blockers import page_is_blocked, pause
+from blockers import UserSkipped, page_is_blocked, pause, pause_yn
 
 
 class NeedsVerification(Exception):
     """El portal del merchant pide verificación de mail, o Goaffpro todavía
     no generó el código de cupón — no es un error del script, hay que
     saltear esta tienda y seguir con la próxima."""
+
+
+class NoCouponCode(Exception):
+    """El dashboard del merchant dice explícitamente que NO hay código de
+    cupón ('No coupon code found!'). Estado final: la tienda se marca como
+    failed (NO CODE en el CSV) y no se reintenta."""
 
 
 from log import log
@@ -20,7 +26,7 @@ from profile_data import (
     PAYPAL_EMAIL,
     PROFILE,
 )
-from winchrome import escape_keys
+from winchrome import escape_keys, ElementNotFound
 
 # Wording alternativo de los mismos botones. Goaffpro y los portales de los
 # merchants se sirven en varios idiomas y cambian el texto de los botones
@@ -32,6 +38,15 @@ CREATE_LABELS = ["Create Account", "Crear una cuenta", "Crear cuenta", "Sign up"
 # Portal de afiliado -> pestaña de pagos. El portal se sirve en el idioma
 # del comercio (las capturas del cliente son en francés), así que cada
 # label se busca en varios idiomas, igual que el resto del flujo.
+# El botón que abre el configurador de método de pago es 'Setup' (o su
+# equivalente); 'Paramètres/Settings' del menú lateral es la página de
+# ajustes generales, NO donde se configura PayPal — clicarlo ahí llevaba
+# a una sección sin campo de e-mail y el flujo se rendía.
+PAYMENT_SETUP_LABELS = [
+    "Setup", "Set up", "Paramétrer", "Parametrer", "Configurer", "Configurar",
+    "Mettre en place", "Einrichten", "Configura", "Activer", "Aktivieren",
+    "Impostare",
+]
 PAYMENT_SETTINGS_LABELS = [
     "Paramètres", "Parametres", "Settings", "Configuración", "Configuracion",
     "Ajustes", "Einstellungen", "Impostazioni",
@@ -43,8 +58,21 @@ PAYMENT_MODE_LABELS = (
 PAYPAL_EMAIL_LABELS = (
     "adresse e-mail paypal", "e-mail paypal", "email paypal", "paypal email",
     "paypal e-mail", "correo paypal", "correo electrónico de paypal",
+    "adresse email", "adresse e-mail", "email address", "courriel",
+    "correo electrónico", "e-mail", "email",
 )
 PAYMENT_SUBMIT_LABELS = ["Soumettre", "Submit", "Enviar", "Guardar", "Save", "Absenden", "Invia"]
+
+
+def _pause_or_skip(reason: str, store: dict | None) -> bool:
+    """Pausa pidiendo intervención. Sin tienda (login global, no hay a quién
+    marcar fallada) es pause() y siempre se sigue. Con tienda es pause_yn():
+    True = el cupón se generó, sigo; False = el usuario marcó que no, el
+    caller levanta UserSkipped y el flujo pasa a la próxima tienda."""
+    if store is None:
+        pause(reason)
+        return True
+    return pause_yn(reason, store["name"])
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +126,7 @@ def login(driver):
     log("goaffpro.login: OK, logueado")
 
 
-def _fill_credentials(driver, email: str, password: str, ctx: str):
+def _fill_credentials(driver, email: str, password: str, ctx: str, store: dict | None = None):
     """Llena email + password ubicando los campos por su label y por el flag
     IsPassword, no por posición. El orden de los campos NO es estable: el
     portal en inglés es Name/Email/Password y el mismo portal en español es
@@ -117,11 +145,12 @@ def _fill_credentials(driver, email: str, password: str, ctx: str):
         email_el = text_els[0] if text_els else None
 
     if email_el is None or pw_el is None:
-        pause(
+        if not _pause_or_skip(
             f"{ctx}: no encontré el formulario de login en la página "
-            f"({len(fields)} campos detectados). Logueate a mano en la ventana de Chrome "
-            "y presioná Enter para que el script siga."
-        )
+            f"({len(fields)} campos detectados). Logueate a mano en la ventana de Chrome.",
+            store,
+        ):
+            raise UserSkipped(f"{ctx}: sin formulario de login, marcada fallada a pedido del usuario")
         return
 
     log("goaffpro: llenando email/password (campos ubicados por label + IsPassword)")
@@ -147,10 +176,13 @@ def _wait_for_turnstile(driver, labels, ctx: str) -> bool:
     return False
 
 
-def _submit_and_wait(driver, labels, ctx: str):
+def _submit_and_wait(driver, labels, ctx: str, store: dict | None = None):
     if not _wait_for_turnstile(driver, labels, ctx):
         log(f"goaffpro: el botón sigue deshabilitado después de 15s — {ctx}", level="warn")
-        pause(f"{ctx}: el botón de submit no se habilitó (Turnstile). Resolvelo a mano y presioná Enter.")
+        if not _pause_or_skip(
+            f"{ctx}: el botón de submit no se habilitó (Turnstile). Resolvelo a mano.", store
+        ):
+            raise UserSkipped(f"{ctx}: Turnstile no habilitó el submit, marcada fallada a pedido del usuario")
 
     try:
         btn = driver.find_any(labels, control_type="Button", timeout=5)
@@ -261,14 +293,29 @@ def _set_per_page_100(driver):
         log("goaffpro.discover: no pude poner 100 por pagina, sigo con lo que haya", level="warn")
 
 
+def _is_search_ready(driver) -> bool:
+    """True si el driver sigue en /stores/search con cards cargadas (la
+    pestaña de Goaffpro sobrevivió al trabajo en la tab secundaria).
+    Chequeo barato: URL + 1 parse local, sin goto ni clicks."""
+    try:
+        if "stores/search" not in (driver.current_url() or ""):
+            return False
+        return len(_parse_cards(driver)) > 0
+    except Exception:
+        return False
+
+
 def _open_page(driver, page: int):
-    """Navega a /affiliate/stores/search y avanza hasta `page`. Se llama de
-    nuevo en CADA ronda (no solo al arrancar): entre cada tienda que
-    yieldeamos, el caller navega a SimplyCodes con el mismo `driver` para
-    cruzarla — cuando el generador retoma, ya no está en Goaffpro. Volver
-    a abrir la página es la forma simple de no asumir dónde quedó el
-    navegador."""
+    """Navega a /affiliate/stores/search y avanza hasta `page`. Apertura
+    completa (goto + Available Stores + 100/página): se usa UNA vez al
+    arrancar y como recuperación si la pestaña se perdió. Entre tiendas
+    NO se reabre — el caller trabaja en tab secundaria y al cerrarla
+    la página sigue intacta (ver winchrome.new_tab)."""
     driver.goto("https://goaffpro.com/affiliate/stores/search")
+    if reason := page_is_blocked(driver):
+        log(f"goaffpro.discover: BLOQUEADO — {reason}")
+        pause(f"Goaffpro Available Stores: {reason}")
+        driver.goto("https://goaffpro.com/affiliate/stores/search")
     driver.click(text="Available Stores", control_type="Hyperlink")
     driver.wait_for_timeout(800)
     if reason := page_is_blocked(driver):
@@ -334,22 +381,43 @@ def iter_instant_access_candidates(driver, conn, stop_event=None):
     final, así que retomar en la página 8 se saltea para siempre las
     tiendas nuevas de las páginas 1-7. Rescanear desde la 1 es barato:
     already_seen() saltea toda tienda ya persistida con un lookup de
-    SQLite y el caller corta apenas junta `count` candidatas nuevas —
-    como las nuevas están adelante, en la práctica frena en 1-2 páginas.
+    SQLite. El caller (main.process_new) corta apenas `count_completed`
+    llega al target, o agota el catálogo entero y lo reintenta desde acá.
 
-    ponytail: reabre la página de Goaffpro desde cero en cada ronda
-    (goto + N clicks en 'Next') en vez de asumir que el navegador se
-    quedó ahí — O(n²) clicks para llegar a la página n, aceptable para
-    decenas de páginas por tanda."""
+    ponytail: la página se abre UNA vez y se avanza con un solo click en
+    'Next' por página. El caller trabaja en tab secundaria (new_tab /
+    close_tab) así que al retomar el generador la página sigue intacta —
+    sin goto + '100 per page' + N clicks por cada tienda (O(n²) antes).
+    Si la pestaña se perdió (navegación manual, crash), se recupera con
+    _open_page como antes."""
     page = 1
+    try:
+        _open_page(driver, page)
+    except ElementNotFound:
+        if stop_event is not None and stop_event.is_set():
+            return
+        raise
+    driver.wait_for_timeout(1500)
 
     while True:
         if stop_event is not None and stop_event.is_set():
             log("goaffpro.discover: ESC detectado, corto (aunque esta página no tuviera candidatas)")
             break
-        log(f"goaffpro.discover: abriendo página {page} de Goaffpro")
-        _open_page(driver, page)
-        driver.wait_for_timeout(1500)
+        # Si la pestaña sobrevivió, reusar sin reabrir. Si no (el caller
+        # navegó en la misma tab en vez de usar secundaria), recuperar.
+        if page > 1 or not _is_search_ready(driver):
+            log(f"goaffpro.discover: abriendo página {page} de Goaffpro")
+            try:
+                if _is_search_ready(driver):
+                    pass  # ya estamos ahí (vuelta de tab secundaria)
+                else:
+                    _open_page(driver, page)
+            except ElementNotFound:
+                if stop_event is not None and stop_event.is_set():
+                    log("goaffpro.discover: corte pedido durante la navegación, aborto sin error")
+                    return
+                raise
+            driver.wait_for_timeout(1500)
 
         cards = _parse_cards(driver)
         log(f"goaffpro.discover: página {page} — {len(cards)} cards")
@@ -391,6 +459,34 @@ def iter_instant_access_candidates(driver, conn, stop_event=None):
         if not has_next:
             log("goaffpro.discover: llegué al final de la lista de Goaffpro")
             break
+        # Avance a la página siguiente con UN click (la página ya está
+        # abierta con 100/página): sin goto ni re-apertura desde la 1.
+        before = cards[0]["store_id"] if cards else None
+        try:
+            driver.activate(driver.find(text="Next", control_type="Button", timeout=3))
+        except Exception as e:
+            log(f"goaffpro.discover: no pude avanzar a la página {page + 1} ({e}), reabro", level="warn")
+            _open_page(driver, page + 1)
+        else:
+            driver.wait_for_timeout(700)
+            for _ in range(15):
+                driver.wheel_scroll(30)
+            driver.wait_for_timeout(300)
+            # Si el click no cambió de página (SPA lagueado), un reintento
+            # antes de seguir: si no, se reparsea la misma página.
+            try:
+                _again = _parse_cards(driver)
+                _first = _again[0]["store_id"] if _again else None
+            except Exception:
+                _first = None
+            if before and _first == before:
+                log(f"goaffpro.discover: 'Next' no cambió la página {page}, reintento", level="warn")
+                try:
+                    driver.activate(driver.find(text="Next", control_type="Button", timeout=3))
+                    driver.wait_for_timeout(1500)
+                except Exception as e2:
+                    log(f"goaffpro.discover: no pude avanzar a la página {page + 1} ({e2}), reabro", level="warn")
+                    _open_page(driver, page + 1)
         page += 1
 
 
@@ -403,14 +499,23 @@ def enroll(driver, store: dict):
     """Se afilia a la tienda. NO lee el código de cupón: el merchant lo
     genera varios minutos después del Enroll, así que leerlo acá daría
     NeedsVerification casi siempre. El código lo lee read_coupon_code() en
-    una pasada posterior (ver main.enroll_and_submit)."""
+    una pasada posterior (ver main.enroll_and_submit).
+
+    Fast path: si la pestaña de /search sobrevivió (tab secundaria
+    cerrada al volver), la card ya está en pantalla — re-parse local sin
+    goto. Solo si no aparece se reabre la página como antes."""
     store_id = store["goaffpro_store_id"]
     page = int(store.get("goaffpro_page") or 1)
-    log(f"goaffpro.enroll: navegando a página {page} de /affiliate/stores/search para '{store['name']}' (store_id={store_id})")
-    _open_page(driver, page)
-
-    cards = _parse_cards(driver)
-    card = next((c for c in cards if c["store_id"] == str(store_id)), None)
+    card = None
+    if _is_search_ready(driver):
+        card = next((c for c in _parse_cards(driver) if c["store_id"] == str(store_id)), None)
+        if card is not None and "enroll_el" in card:
+            log(f"goaffpro.enroll: card de '{store['name']}' ya en pantalla, sin reabrir (fast path)")
+    if card is None:
+        log(f"goaffpro.enroll: navegando a página {page} de /affiliate/stores/search para '{store['name']}' (store_id={store_id})")
+        _open_page(driver, page)
+        cards = _parse_cards(driver)
+        card = next((c for c in cards if c["store_id"] == str(store_id)), None)
     if card is None or "enroll_el" not in card:
         raise RuntimeError(f"no encontré la card de '{store['name']}' (store_id={store_id}) para hacer Enroll")
 
@@ -423,6 +528,7 @@ def enroll(driver, store: dict):
         driver.activate(driver.find_any(["Submit information", "Enviar información"]))
         driver.wait_for_timeout(2000)
         _handle_merchant_portal(driver, store)
+        driver.close_tab()  # cierra la pestaña del portal, no queda acumulando una por tienda
     else:
         log(f"goaffpro.enroll: '{store['name']}' sin portal externo, el código sale de 'My Stores'")
 
@@ -551,10 +657,76 @@ def _fill_signup_form(driver, fields, store: dict, password: str):
 
     if unknown:
         detalle = ", ".join(repr(lbl) for lbl, _ in unknown)
-        pause(
+        if not _pause_or_skip(
             f"{store['name']}: el portal pide campo(s) que el perfil fijo no cubre: {detalle}. "
-            "Completalos a mano en la ventana de Chrome (sin enviar el form) y presioná Enter."
-        )
+            "Completalos a mano en la ventana de Chrome (sin enviar el form).",
+            store,
+        ):
+            raise UserSkipped(f"{store['name']}: campos desconocidos, marcada fallada a pedido del usuario")
+
+
+def _try_merchant_login(driver, store: dict, password: str) -> bool:
+    """Intenta loguear en el portal del merchant con el mail/password de la
+    cuenta Goaffpro (misma credencial usada al crear la cuenta, ver
+    _handle_merchant_portal). Devuelve True si el form de password
+    desapareció después de enviar."""
+    _fill_credentials(driver, PROFILE["email"], password, f"{store['name']}: login portal merchant", store)
+    _submit_and_wait(driver, LOGIN_LABELS, f"{store['name']}: login portal merchant", store)
+    _dismiss_save_password_popup(driver)
+    driver.wait_for_timeout(1000)
+    return not any(driver.is_password(el) for _, el in driver.form_fields())
+
+
+def _log_dashboard_summary(driver, store: dict):
+    """Loguea de forma bien visible lo que hay en el dashboard del merchant
+    ANTES de avanzar a otra página. Sin esto, después de resolver un login
+    (automático o a mano) el flujo saltaba derecho a 'My Stores' sin dejar
+    rastro de qué se vio en el dashboard."""
+    text = driver.page_text()
+    pct, amt = _parse_discount(text)
+    commission = _parse_commission(text)
+    discount = f"{pct}%" if pct else (f"${amt}" if amt else "no publicado")
+    log("=" * 60, level="ok")
+    log(f"DASHBOARD '{store['name']}' — {driver.current_url()}", level="ok")
+    log(f"  Descuento del cupón: {discount}", level="ok")
+    log(f"  Comisión de afiliado: {commission + '%' if commission else 'no encontrada'}", level="ok")
+    log("=" * 60, level="ok")
+
+
+# El portal de Goaffpro manda un mail de verificación al crear la cuenta
+# ('We have sent you an account verification email. Kindly check your
+# inbox... Resend Verification Email'). Se detecta y se pide intervención:
+# sin verificar, el merchant no genera el código de cupón.
+_EMAIL_VERIFICATION_NEEDLES = (
+    "verification email", "verify your email", "verify your e-mail",
+    "check your inbox", "resend verification", "verification link",
+    "verificar tu email", "verificar tu correo", "verifica tu email",
+    "verifica tu correo", "verificación de tu correo", "bandeja de entrada",
+    "mail de verificación", "correo de verificación",
+)
+
+
+def _needs_email_verification(driver) -> bool:
+    """True si el portal del merchant muestra el aviso de verificación por
+    email ('We have sent you an account verification email. Kindly check
+    your inbox... Resend Verification Email'). Hasta que no se verifica,
+    el merchant no genera el código — hay que parar y pedir intervención."""
+    text = driver.page_text().lower()
+    return any(n in text for n in _EMAIL_VERIFICATION_NEEDLES)
+
+
+def _pause_for_email_verification(driver, store: dict):
+    log(
+        f"goaffpro.enroll: '{store['name']}' pide verificar la cuenta por email — esperando intervención",
+        level="warn",
+    )
+    if not pause_yn(
+        f"{store['name']}: el portal del merchant (goaffpro) pide verificar la cuenta por email "
+        f"({PROFILE['email']}). Abrí el mail de verificación y confirmá la cuenta.",
+        store["name"],
+    ):
+        raise UserSkipped(f"{store['name']}: sin cupón tras verificar, marcada fallada a pedido del usuario")
+    driver.wait_for_timeout(1500)
 
 
 def _handle_merchant_portal(driver, store: dict):
@@ -565,7 +737,11 @@ def _handle_merchant_portal(driver, store: dict):
     driver.wait_for_timeout(1500)
     if reason := page_is_blocked(driver):
         log(f"goaffpro.enroll: BLOQUEADO en portal del merchant — {reason}")
-        pause(f"{store['name']}: portal del merchant — {reason}")
+        if not _pause_or_skip(f"{store['name']}: portal del merchant — {reason}", store):
+            raise UserSkipped(f"{store['name']}: portal bloqueado, marcada fallada a pedido del usuario")
+
+    if _needs_email_verification(driver):
+        _pause_for_email_verification(driver, store)
 
     has_form, fields = _portal_has_signup_form(driver)
     if not has_form:
@@ -583,23 +759,39 @@ def _handle_merchant_portal(driver, store: dict):
 
     if reason := page_is_blocked(driver):
         log(f"goaffpro.enroll: BLOQUEADO al crear cuenta — {reason}")
-        pause(f"{store['name']}: creación de cuenta en portal del merchant — {reason}")
+        if not _pause_or_skip(f"{store['name']}: creación de cuenta en portal del merchant — {reason}", store):
+            raise UserSkipped(f"{store['name']}: bloqueo al crear cuenta, marcada fallada a pedido del usuario")
 
-    _submit_and_wait(driver, CREATE_LABELS, f"{store['name']}: Create Account")
+    _submit_and_wait(driver, CREATE_LABELS, f"{store['name']}: Create Account", store)
     _dismiss_save_password_popup(driver)
 
+    if _needs_email_verification(driver):
+        _pause_for_email_verification(driver, store)
+
     if driver.exists_any(["You already have an account", "Ya tenés una cuenta", "Ya tiene una cuenta"]):
+        if _needs_email_verification(driver):
+            _pause_for_email_verification(driver, store)
         log(
-            f"goaffpro.enroll: '{store['name']}' ya tiene cuenta en este portal (intento previo) — "
-            "no tenemos la password guardada",
-            level="warn",
+            f"goaffpro.enroll: '{store['name']}' ya tiene cuenta en este portal — "
+            f"intento loguear con {PROFILE['email']}"
         )
         if driver.exists_any(["Click here to login", "Iniciar sesión"]):
             driver.activate(driver.find_any(["Click here to login", "Iniciar sesión"]))
-        pause(
-            f"{store['name']}: el portal dice que ya existe una cuenta con {PROFILE['email']} pero no "
-            "tenemos la password guardada. Logueate a mano en Chrome y presioná Enter para seguir."
-        )
+            driver.wait_for_timeout(1000)
+
+        if _try_merchant_login(driver, store, password):
+            store["merchant_email"] = PROFILE["email"]
+            store["merchant_password"] = password
+            log(f"goaffpro.enroll: '{store['name']}' login automático OK con cuenta existente", level="ok")
+        else:
+            log(f"goaffpro.enroll: '{store['name']}' login automático falló", level="warn")
+            if not _pause_or_skip(
+                f"{store['name']}: el portal dice que ya existe una cuenta con {PROFILE['email']} pero el "
+                "login automático con la password guardada falló. Logueate a mano en Chrome.",
+                store,
+            ):
+                raise UserSkipped(f"{store['name']}: login manual no logró el cupón, marcada fallada a pedido del usuario")
+        _log_dashboard_summary(driver, store)
         return
 
     for _ in range(24):
@@ -620,49 +812,161 @@ def _handle_merchant_portal(driver, store: dict):
 
 
 def read_coupon_code(driver, store: dict):
-    """Lee el código de cupón real desde 'My Stores' de Goaffpro y lo deja
-    en store['affiliate_code'], además de la screenshot de prueba.
+    """Lee el código de cupón real y lo deja en store['affiliate_code'],
+    además de la screenshot de prueba.
 
-    /affiliate/stores expone, por cada tienda afiliada, un panel con esta
-    estructura fija en el árbol de accesibilidad (confirmada en vivo):
+    Fuente 1: 'My Stores' (/affiliate/stores). Expone, por cada tienda
+    afiliada, un panel con estructura fija (confirmada en vivo):
 
         Text '<Nombre de la tienda>'
         Text 'Referral Link'   -> Edit 'https://.../?ref=xxxx'
         Text 'Coupon Code'     -> Edit 'TOMASRIOS'        (opcional)
         Hyperlink 'Go to portal'
 
-    Leerlo de ahí reemplaza a la regex `\\b[A-Z0-9]{5,}\\b` sobre el texto
-    del portal del merchant, que agarraba cualquier palabra en mayúsculas
-    de la página: en las corridas anteriores devolvió 'CLOUDFLARE' (del
-    widget de Turnstile) como si fuera un código válido, y además tapaba el
-    chequeo de "falta verificar el mail", que solo corría cuando la regex
-    no matcheaba nada — o sea, casi nunca.
+    Ojo: My Stores pagina de a 10 ('Page 1 of 3' confirmado en vivo) — el
+    panel de una tienda recién afiliada puede estar en la página 2/3, así
+    que se recorre con 'Next' hasta encontrarla. Sin esto se veía
+    'Phillips Moore' marcada 'pendiente de verificación' con el código ya
+    publicado (su panel estaba en la página 3).
 
-    Si el panel de la tienda no tiene bloque 'Coupon Code', el código
-    todavía no existe: eso es NeedsVerification de verdad, no una
-    adivinanza sobre el texto de la página."""
+    Fuente 2 (fallback, si el panel no aparece o no tiene bloque 'Coupon
+    Code'): el dashboard del portal del merchant, donde el código está a
+    simple vista ('Coupon Code 25% off' + 'tomasrios' — es el MISMO
+    template Goaffpro en todos los portales {tienda}.goaffpro.com). El
+    bot pasa por ese dashboard en el enroll, así que no leerlo ahí era
+    dejar tirado un código visible por culpa del panel de My Stores.
+
+    El código leído de la fuente 2 se ancla al label del cupón — la regex
+    vieja `\\b[A-Z0-9]{5,}\\b` agarraba 'CLOUDFLARE' (widget Turnstile)
+    como si fuera un código válido y tapaba el chequeo de verificación de
+    mail. Eso NO vuelve.
+
+    Si ninguna fuente muestra código, el código todavía no existe: eso es
+    NeedsVerification de verdad, no una adivinanza sobre el texto."""
     log(f"goaffpro.read_coupon_code: abriendo My Stores para '{store['name']}'")
     driver.goto("https://goaffpro.com/affiliate/stores")
     driver.wait_for_timeout(2500)
 
     panel = _find_panel(driver, store["name"], store.get("domain", ""))
-    if panel is None or not panel["code"]:
-        raise NeedsVerification(
-            f"'{store['name']}' todavía no tiene 'Coupon Code' en My Stores "
-            "(falta aprobación/verificación del merchant o no genera cupones)"
+    while panel is None and _click_next(driver):
+        panel = _find_panel(driver, store["name"], store.get("domain", ""))
+
+    if panel is not None and panel["code"]:
+        store["affiliate_code"] = panel["code"]
+        log(f"goaffpro.read_coupon_code: código de '{store['name']}' = {panel['code']!r}", level="ok")
+
+        if not panel["portal"]:
+            raise NeedsVerification(f"'{store['name']}' no tiene link 'Go to portal' en My Stores")
+        _read_dashboard(driver, store, panel["portal"])
+        # El método de pago se configura al final del flujo (después de
+        # subir el cupón), no acá: es independiente del cupón.
+        store["portal_url"] = panel["portal"]
+        return
+
+    if _dashboard_fallback(driver, store, panel):
+        return
+
+    raise NeedsVerification(
+        f"'{store['name']}' todavía no tiene 'Coupon Code' en My Stores "
+        "(falta aprobación/verificación del merchant o no genera cupones)"
+    )
+
+
+def _click_next(driver) -> bool:
+    """Pasa a la página siguiente de My Stores (paginado de a 10, sin
+    query param en la URL). Devuelve False si ya no hay página siguiente."""
+    try:
+        btn = driver.find(text="Next", control_type="Button", timeout=3)
+    except ElementNotFound:
+        return False
+    try:
+        if not btn.is_enabled():
+            return False
+    except Exception:
+        return False
+    driver.activate(btn)
+    driver.wait_for_timeout(2000)
+    return True
+
+
+def _dashboard_coupon_code(driver) -> str | None:
+    """Código del cupón en el dashboard del portal del merchant.
+
+    El dashboard (mismo template Goaffpro en todos los portales
+    {tienda}.goaffpro.com) muestra el bloque:
+
+        'Coupon Code 25% off' / descripción / CÓDIGO
+
+    El código es el primer Text sin espacios que sigue al label del cupón
+    (confirmado en vivo en phillips-moore.goaffpro.com: 'tomasrios').
+    Anclarse al label es lo que evita el falso positivo de la regex vieja
+    ('CLOUDFLARE' del widget de Turnstile)."""
+    items = driver.ordered(control_types=("Text",))
+    label_idx = next(
+        (i for i, (_, name, _) in enumerate(items) if re.search(_COUPON_LABEL, name, re.IGNORECASE)),
+        None,
+    )
+    if label_idx is None:
+        return None
+    for _, name, _ in items[label_idx + 1:]:
+        if not name:
+            continue
+        # El merchant NO publicó código: el template lo dice explícito
+        # ("No coupon code found! ..."). Estado final — el código no existe,
+        # no se adivina ni se reintenta.
+        if re.search(
+            r"no\s+(coupon\s+code|code|coupon)\s+(found|available)|"
+            r"no\s+se\s+encontr[oó]|c[oó]digo\s+no\s+(disponible|encontrado)",
+            name,
+            re.IGNORECASE,
+        ):
+            raise NoCouponCode(f"el dashboard dice que no hay cupón disponible: {name!r}")
+        # 'Summary' es el encabezado de la sección de estadísticas que sigue
+        # a la card del cupón: no pertenece a la card, hay que cortar acá
+        # (sin esto se leía 'Summary' como si fuera el código cuando el
+        # merchant no tenía cupón).
+        if re.match(r"^(summary|resumen|overview)$", name.strip(), re.IGNORECASE):
+            return None
+        if " " not in name and len(name) >= 3:
+            return name
+    return None
+
+
+def _dashboard_fallback(driver, store: dict, panel: dict | None = None) -> bool:
+    """Fallback de read_coupon_code: lee código + descuento del dashboard
+    del portal del merchant cuando My Stores no lo trae (panel ausente o
+    sin bloque 'Coupon Code'). El código está a simple vista ahí.
+
+    Se entra por el link 'Go to portal' si el panel existía; si no, por
+    https://{affiliate_portal}/ — la sesión del portal quedó abierta en el
+    perfil de Chrome durante el enroll, así que entra sin password.
+
+    Devuelve True si consiguió el código. False = seguir con
+    NeedsVerification."""
+    portal = panel.get("portal") if panel else None
+    host = (store.get("affiliate_portal") or "").strip()
+    url = portal or (f"https://{host}" if host else "")
+    if not url:
+        log(
+            "goaffpro.read_coupon_code: sin link 'Go to portal' ni affiliate_portal, no puedo leer el dashboard",
+            level="warn",
         )
-
-    store["affiliate_code"] = panel["code"]
-    log(f"goaffpro.read_coupon_code: código de '{store['name']}' = {panel['code']!r}", level="ok")
-
-    if not panel["portal"]:
-        raise NeedsVerification(f"'{store['name']}' no tiene link 'Go to portal' en My Stores")
-    _read_dashboard(driver, store, panel["portal"])
-
-    # El método de pago se configura al final del flujo (después de subir el
-    # cupón), no acá: es independiente del cupón y no debe frenar la carga.
-    # Se deja el portal para que el caller lo llame cuando corresponda.
-    store["portal_url"] = panel["portal"]
+        return False
+    log(f"goaffpro.read_coupon_code: leyendo código del dashboard {url}")
+    driver.goto(url)
+    driver.wait_for_timeout(4000)
+    code = _dashboard_coupon_code(driver)
+    if not code:
+        log(
+            f"goaffpro.read_coupon_code: '{store['name']}' no muestra 'Coupon Code' en el dashboard tampoco",
+            level="warn",
+        )
+        return False
+    store["affiliate_code"] = code
+    log(f"goaffpro.read_coupon_code: código de '{store['name']}' (dashboard) = {code!r}", level="ok")
+    _read_dashboard_data(driver, store)
+    store["portal_url"] = url
+    return True
 
 
 _REFERRAL = "referral link"
@@ -759,7 +1063,13 @@ def _read_dashboard(driver, store: dict, portal_url: str):
     log(f"goaffpro.read_coupon_code: abriendo el portal del merchant de '{store['name']}'")
     driver.goto(portal_url)
     driver.wait_for_timeout(4000)
+    _read_dashboard_data(driver, store)
 
+
+def _read_dashboard_data(driver, store: dict):
+    """Descuento + screenshot del dashboard YA abierto (lo separado de
+    _read_dashboard para poder reusarlo en el fallback de dashboard
+    directo, donde el portal ya está cargado)."""
     text = driver.page_text()
     pct, amt = _parse_discount(text)
     if pct is not None:
@@ -881,7 +1191,7 @@ def _labeled_field(fields, needles, control_type: str):
 def set_payment_method(driver, store: dict, portal_url: str) -> bool:
     """Configura PayPal como método de pago de comisiones en el portal de
     afiliado de la tienda (pedido del cliente: pantalla Paiements ->
-    Paramètres -> Mode de paiement = PayPal + e-mail).
+    Setup -> selector -> PayPal + e-mail -> submit).
 
     Devuelve True si quedó configurado (o ya lo estaba). No levanta
     excepción por no encontrar la pantalla: hay portales sin sección de
@@ -908,16 +1218,31 @@ def set_payment_method(driver, store: dict, portal_url: str) -> bool:
         store["payment_method"] = "paypal"
         return True
 
-    if not driver.exists_any(PAYMENT_SETTINGS_LABELS):
+    # El configurador se abre con el botón 'Setup' de la sección de pagos.
+    # El 'Paramètres/Settings' del menú lateral lleva a los ajustes generales
+    # del portal, donde NUNCA hay campo de e-mail de PayPal — clicarlo daba
+    # 'no configuro nada' y rendía el flujo.
+    setup = None
+    if driver.exists_any(PAYMENT_SETUP_LABELS):
+        setup = driver.find_any(PAYMENT_SETUP_LABELS)
+        log("goaffpro.set_payment_method: click en Setup")
+    elif driver.exists_any(PAYMENT_SETTINGS_LABELS):
+        setup = driver.find_any(PAYMENT_SETTINGS_LABELS)
+        log("goaffpro.set_payment_method: click en Paramètres/Settings")
+    else:
         log(f"goaffpro.set_payment_method: '{store['name']}' no muestra botón de configuración de pagos", level="warn")
         return False
-
-    log("goaffpro.set_payment_method: click en Paramètres/Settings")
-    driver.activate(driver.find_any(PAYMENT_SETTINGS_LABELS))
+    driver.activate(setup)
     driver.wait_for_timeout(2000)
 
+    # el panel de setup suele tener UN selector (el del modo de pago); si el
+    # label no matchea, cae al primer ComboBox del form para no rendirse
     fields = driver.form_fields()
     combo = _labeled_field(fields, PAYMENT_MODE_LABELS, "ComboBox")
+    if combo is None:
+        combo = next((el for _, el in fields if el.element_info.control_type == "ComboBox"), None)
+        if combo is not None:
+            log("goaffpro.set_payment_method: selector de modo de pago sin label conocido, uso el primer ComboBox")
     if combo is not None and not _choose_option(driver, combo, "PayPal"):
         log("goaffpro.set_payment_method: no pude elegir 'PayPal' en el modo de pago", level="warn")
 
@@ -925,6 +1250,14 @@ def set_payment_method(driver, store: dict, portal_url: str) -> bool:
     driver.wait_for_timeout(800)
     fields = driver.form_fields()
     email_el = _labeled_field(fields, PAYPAL_EMAIL_LABELS, "Edit")
+    if email_el is None:
+        email_el = next(
+            (el for _, el in fields
+             if el.element_info.control_type == "Edit" and not driver.is_password(el)),
+            None,
+        )
+        if email_el is not None:
+            log("goaffpro.set_payment_method: campo de e-mail sin label conocido, uso el primer Edit no-password")
     if email_el is None:
         log(
             f"goaffpro.set_payment_method: '{store['name']}' no muestra el campo de e-mail de PayPal, "

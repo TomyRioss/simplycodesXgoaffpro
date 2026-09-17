@@ -8,5 +8,8 @@ debug_*.html
 __pycache__/
 config.json
 export_*.csv
+export.csv
+run.log
 errors.log
+status.json
 STOP

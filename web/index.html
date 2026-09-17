@@ -74,6 +74,12 @@
   /* ---------- contenido ---------- */
   main { padding: 34px 34px 56px; height: 100vh; overflow-y: auto; }
   main > .view { max-width: 1100px; }
+  #view-launcher.view { max-width: none; }
+  .launcher-layout { display: grid; grid-template-columns: minmax(0, 620px) minmax(280px, 380px); gap: 34px; align-items: start; }
+  .console-panel { position: sticky; top: 0; }
+  .console-panel h2 { margin-bottom: 10px; }
+  .console-panel pre { height: 70vh; margin: 0; font-size: 12.5px; }
+  @media (max-width: 1040px) { .launcher-layout { grid-template-columns: 1fr; } .console-panel { position: static; } .console-panel pre { height: 40vh; } }
   h1 { font-family: var(--display); font-size: 27px; font-weight: 400; margin: 0 0 6px;
        letter-spacing: -0.01em; text-wrap: balance; }
   .lede { color: var(--muted); margin: 0 0 30px; max-width: 68ch; text-wrap: pretty; }
@@ -96,6 +102,8 @@
   .check { display: flex; gap: 13px; align-items: flex-start; margin-top: 20px; cursor: pointer; }
   .check b { display: block; font-size: 14px; font-weight: 600; }
   .check span { font-size: 13px; color: var(--muted); }
+  .saField { display: flex; flex-direction: column; gap: 4px; width: 130px; flex: none; cursor: auto; }
+  .saLabel { font-size: 12px; color: var(--muted); }
 
   /* toggle: el input nativo sigue siendo el control (teclado, foco, forms),
      solo se le dibuja encima la pista y la perilla */
@@ -247,6 +255,8 @@
     <p class="lede">El programa toma la ventana de Chrome mientras trabaja: no uses la computadora hasta que termine.
        Para cortar: <b>Ctrl+Alt+F12</b> (funciona con cualquier ventana activa) o el bot&oacute;n <b>Detener</b>.</p>
 
+    <div class="launcher-layout">
+    <div>
     <form id="f">
       <section>
         <h2>Cuenta Goaffpro</h2>
@@ -281,7 +291,6 @@
       <section>
         <h2>Corrida</h2>
         <div class="grid">
-          <div><label for="sa">Cantidad de tiendas a completar</label><input id="sa" type="number" name="stop_after" min="1" placeholder="sin tope"></div>
           <div class="wide"><label for="cd">Carpeta para los CSV</label>
             <div class="path">
               <input id="cd" type="text" name="csv_dir" placeholder="C:\Users\Pc\Desktop\csv">
@@ -290,6 +299,10 @@
           </div>
         </div>
         <label class="check">
+          <div id="saField" class="saField">
+            <span class="saLabel">Cantidad de tiendas a completar</span>
+            <input id="sa" type="number" name="stop_after" min="1" placeholder="sin tope" aria-label="Cantidad de tiendas a completar">
+          </div>
           <input type="checkbox" class="switch" role="switch" id="unlimited">
           <span><b>Correr indefinido</b>
             Sin tope de tiendas: sigue buscando y completando hasta que apret&eacute;s ESC, Ctrl+Alt+F12 o el bot&oacute;n Detener.</span>
@@ -309,6 +322,13 @@
       </div>
       <div id="msg"></div>
     </form>
+    </div>
+
+    <aside class="console-panel">
+      <h2>Consola (&uacute;ltima corrida)</h2>
+      <pre class="errlog" id="runLog">Todav&iacute;a no hay nada corrido.</pre>
+    </aside>
+    </div>
   </div>
 
   <!-- ---------------- Historial ---------------- -->
@@ -390,8 +410,9 @@ $('#stop').addEventListener('click', async () => {
 
 /* "Correr indefinido" es solo UI: no manda nada al server, refleja/vacía
    el input de stop_after (vacío = sin tope, ya lo interpreta config.py) */
-const stopAfter = $('#sa'), unlimited = $('#unlimited');
+const stopAfter = $('#sa'), unlimited = $('#unlimited'), saField = $('#saField');
 function syncUnlimited() {
+  saField.hidden = unlimited.checked;
   stopAfter.disabled = unlimited.checked;
   if (unlimited.checked) stopAfter.value = '';
 }
@@ -438,11 +459,22 @@ form.addEventListener('submit', async e => {
   poll();
 });
 
+async function loadRunLog() {
+  const box = $('#runLog');
+  const text = await (await fetch('/log')).text();
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.textContent = text || 'Todavía no hay nada corrido.';
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+loadRunLog();
+
 async function poll() {
+  loadRunLog();
   const s = await (await fetch('/status')).json();
   if (s.running) { startBtn.disabled = true; setTimeout(poll, 3000); return; }
   startBtn.disabled = false;
   setState('done');
+  loadRunLog();
   const err = await refreshErrCount();
   if (err > 0) say('Termin\u00f3 con ' + err + ' error(es). Mir\u00e1 "Error logs" en el men\u00fa.', 'err');
   else say('Termin\u00f3. El CSV est\u00e1 en el historial.', 'ok');
